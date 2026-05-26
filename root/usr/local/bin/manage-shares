@@ -1,0 +1,594 @@
+#!/bin/ash
+
+SHARE_LIST="/etc/samba/shares.list"
+SMB_CONF="/etc/samba/smb.conf"
+TMP_CONF="/tmp/smb.conf.tmp"
+
+CHANGES_PENDING=0
+touch "$SHARE_LIST"
+
+# ==========================================
+# Self-Healing Dependency Checks
+# ==========================================
+if ! apk info -e samba >/dev/null 2>&1; then
+    clear
+    echo "⚙️  First Run Detected: Installing required Samba dependencies..."
+    apk add samba samba-common-tools
+    echo "⚙️  Configuring Samba to start on boot..."
+    rc-update add samba default >/dev/null 2>&1
+    rc-service samba start >/dev/null 2>&1
+    echo "✅ Samba installed and configured successfully."
+    sleep 2
+fi
+
+# ==========================================
+# Background Synchronizers
+# ==========================================
+compile_and_reload() {
+    CHANGES_PENDING=1
+    echo "⚙️  Synchronizing Samba configuration in the background..."
+    cat <<EOF > "$TMP_CONF"
+[global]
+   workgroup = WORKGROUP
+   server string = Alpine Network Storage
+   security = user
+   map to guest = Bad User
+   log file = /var/log/samba/log.%m
+   max log size = 50
+   load printers = no
+   printing = bsd
+   printcap name = /dev/null
+   disable spoolss = yes
+EOF
+
+    while IFS='|' read -r name path perm mask; do
+        [ -z "$name" ] && continue
+        echo "" >> "$TMP_CONF"
+        echo "[$name]" >> "$TMP_CONF"
+        echo "   path = $path" >> "$TMP_CONF"
+        echo "   browseable = yes" >> "$TMP_CONF"
+        echo "   guest ok = no" >> "$TMP_CONF"
+        echo "   valid users = @storage-rw @storage-ro" >> "$TMP_CONF"
+
+        if [ "$perm" = "RW" ]; then
+            echo "   writable = yes" >> "$TMP_CONF"
+            echo "   write list = @storage-rw" >> "$TMP_CONF"
+            echo "   force create mode = 0660" >> "$TMP_CONF"
+            echo "   force directory mode = 0770" >> "$TMP_CONF"
+        else
+            echo "   writable = no" >> "$TMP_CONF"
+            echo "   write list =" >> "$TMP_CONF"
+        fi
+
+        if [ "$mask" = "root" ]; then
+            echo "   force user = root" >> "$TMP_CONF"
+            echo "   force group = root" >> "$TMP_CONF"
+        fi
+    done < "$SHARE_LIST"
+
+    # --- SMART STATE DETECTOR ---
+    # Extracts a list of all currently root-masked shares from the old and new configs
+    OLD_MASKS=$(awk '/^\[.*\]/{share=$0} /force user = root/{print share}' "$SMB_CONF" 2>/dev/null)
+    NEW_MASKS=$(awk '/^\[.*\]/{share=$0} /force user = root/{print share}' "$TMP_CONF" 2>/dev/null)
+
+    mv "$TMP_CONF" "$SMB_CONF"
+
+    # Compare the old masking state to the new masking state
+    if [ "$OLD_MASKS" != "$NEW_MASKS" ]; then
+        echo "⚠️  Security context (Root Mask) changes detected."
+        echo "🧨 Performing hard Samba restart to flush client security tokens..."
+        rc-service samba restart >/dev/null 2>&1
+        echo "✅ Samba restarted successfully."
+        sleep 2
+    else
+        rc-service samba reload >/dev/null 2>&1
+        echo "✅ Network shares dynamically reloaded (Active connections preserved)."
+        sleep 1
+    fi
+}
+
+resolve_target_dir() {
+    local D_NAME="$1"
+    local ZFS_MNT=$(zfs get -H -o value mountpoint vaultpool/$D_NAME 2>/dev/null || zfs get -H -o value mountpoint fastpool/$D_NAME 2>/dev/null)
+    
+    if echo "$ZFS_MNT" | grep -q "^/vaultpool/\|^/fastpool/"; then
+        echo "/mnt/$D_NAME|MergerFS Union"
+    else
+        echo "$ZFS_MNT|Direct ZFS Mount"
+    fi
+}
+
+# ==========================================
+# Infrastructure Logic
+# ==========================================
+create_dataset() {
+    echo ""
+    echo "--- Create New ZFS Storage Dataset ---"
+    printf "Enter new dataset name: "
+    read D_NAME
+    
+    if ! echo "$D_NAME" | grep -Eq '^[a-zA-Z0-9_-]+$'; then echo "❌ Error: Invalid name."; return; fi
+    if zfs list -H -o name vaultpool/$D_NAME >/dev/null 2>&1; then echo "❌ Error: Dataset already exists."; return; fi
+
+    echo ""
+    echo "Select Storage Tier:"
+    echo "1) HDD Archive Only (vaultpool)"
+    echo "2) Cache-Tiered     (Both fastpool & vaultpool - Requires MergerFS)"
+    echo "3) NVMe Cache Only  (fastpool)"
+    printf "Choice [1-3]: "
+    read TIER
+
+    echo ""
+    echo "💡 Common Direct ZFS Mount Paths:"
+    echo "   /var/lib/docker      (Docker Engine Root)"
+    echo "   /var/lib/containerd  (Containerd Root)"
+    echo "   /var/lib/libvirt     (Virtual Machine Images)"
+    echo "   /var/lib/postgresql  (Database Storage)"
+    printf "Custom Direct Mount (Leave blank to use MergerFS at /mnt/$D_NAME): "
+    read CUSTOM_MNT
+    
+    if [ -n "$CUSTOM_MNT" ]; then
+        if [ "$TIER" = "2" ]; then
+            echo "❌ Error: Cache-Tiered datasets cannot use a custom Direct ZFS mount."
+            return
+        fi
+        
+        MNT_PATH="$CUSTOM_MNT"
+        MNT_FLAG="-o mountpoint=$CUSTOM_MNT"
+        if [ -d "$CUSTOM_MNT" ] && [ "$(ls -A "$CUSTOM_MNT" 2>/dev/null)" ]; then
+            echo "❌ Error: Mount path '$CUSTOM_MNT' already exists and contains files!"
+            return
+        fi
+    else
+        MNT_PATH="/mnt/$D_NAME"
+        MNT_FLAG="" 
+    fi
+
+    echo ""
+    echo "Select Workload Tuning (1: 128K Gen, 2: 1M Media, 3: 16K AppData) [1-3]: "
+    read PROFILE
+    case "$PROFILE" in 2) REC="1M" ;; 3) REC="16K" ;; *) REC="128K" ;; esac
+    
+    echo "⚙️  Provisioning storage..."
+    if [ -n "$CUSTOM_MNT" ]; then
+        mkdir -p "$CUSTOM_MNT"
+        lbu include add "$CUSTOM_MNT"
+        lbu exclude add "${CUSTOM_MNT}/*"
+    fi
+
+    if [ "$TIER" = "1" ] || [ "$TIER" = "2" ]; then zfs create -o recordsize=$REC -o compression=lz4 $MNT_FLAG vaultpool/$D_NAME; fi
+    if [ "$TIER" = "2" ] || [ "$TIER" = "3" ]; then zfs create -o recordsize=$REC -o compression=lz4 $MNT_FLAG fastpool/$D_NAME; fi
+
+    CHANGES_PENDING=1
+
+    if [ "$MNT_PATH" = "/var/lib/docker" ]; then
+        echo ""
+        echo "🐳 Docker mount path detected!"
+        if ! apk info -e docker >/dev/null 2>&1; then
+            echo "⚙️  Installing Docker Engine and Compose utilities..."
+            apk add docker docker-cli-compose
+            echo "⚙️  Registering Docker daemon to start on boot..."
+            rc-update add docker default >/dev/null 2>&1
+            echo "⚙️  Starting Docker service..."
+            rc-service docker start
+            echo "✅ Docker Engine is online and mapped directly to your ZFS array!"
+        else
+            echo "✅ Docker packages already installed. Restarting daemon to bind to new dataset..."
+            rc-service docker restart
+        fi
+        sleep 2
+    fi
+}
+
+delete_dataset() {
+    D_NAME="$1"
+    TARGET_DIR="$2"
+    
+    if [ "$TARGET_DIR" = "/var/lib/docker" ]; then
+        if apk info -e docker >/dev/null 2>&1; then
+            if [ "$(docker ps -aq 2>/dev/null | wc -l)" -gt 0 ]; then
+                echo "❌ Error: Active or stopped Docker containers detected! Clear them first."
+                return 1
+            fi
+            echo "🐳 Halting Docker daemon for infrastructure teardown..."
+            rc-service docker stop >/dev/null 2>&1
+        fi
+    else
+        ITEMS=$(ls -A "$TARGET_DIR" 2>/dev/null | wc -l)
+        if [ "$ITEMS" -gt 0 ]; then
+            echo "❌ Error: Dataset '$D_NAME' is NOT empty ($ITEMS items found)!"
+            return 1
+        fi
+    fi
+    
+    echo ""
+    printf "⚠️  Type the exact name '%s' to confirm destruction: " "$D_NAME"
+    read CONFIRM
+    if [ "$CONFIRM" != "$D_NAME" ]; then 
+        echo "❌ Aborted."
+        [ "$TARGET_DIR" = "/var/lib/docker" ] && rc-service docker start >/dev/null 2>&1
+        return 1
+    fi
+    
+    zfs destroy -r vaultpool/$D_NAME >/dev/null 2>&1 && echo "✅ Destroyed vaultpool/$D_NAME"
+    zfs destroy -r fastpool/$D_NAME >/dev/null 2>&1 && echo "✅ Destroyed fastpool/$D_NAME"
+    
+    rmdir "$TARGET_DIR" >/dev/null 2>&1
+    grep -v "|$TARGET_DIR|" "$SHARE_LIST" > "${SHARE_LIST}.tmp"
+    mv "${SHARE_LIST}.tmp" "$SHARE_LIST"
+    
+    compile_and_reload
+
+    if [ "$TARGET_DIR" = "/var/lib/docker" ]; then
+        echo ""
+        printf "🗑️  Dataset gone. Do you want to explicitly uninstall Docker from Alpine? [y/N]: "
+        read UNINSTALL_DOCKER
+        if [ "$UNINSTALL_DOCKER" = "y" ] || [ "$UNINSTALL_DOCKER" = "Y" ]; then
+            echo "⚙️  Removing Docker from startup and uninstalling packages..."
+            rc-update del docker default >/dev/null 2>&1
+            apk del docker docker-cli-compose
+            rm -rf /etc/docker >/dev/null 2>&1
+            echo "✅ Docker Engine securely uninstalled from the system."
+            sleep 2
+        fi
+    fi
+    return 0
+}
+
+manage_dataset_menu() {
+    D_NAME="$1"
+
+    while true; do
+        clear
+        
+        RESOLVED=$(resolve_target_dir "$D_NAME")
+        TARGET_DIR=$(echo "$RESOLVED" | cut -d'|' -f1)
+        MNT_TYPE=$(echo "$RESOLVED" | cut -d'|' -f2)
+
+        MATCH=$(grep "|$TARGET_DIR|" "$SHARE_LIST")
+        if [ -n "$MATCH" ]; then 
+            PERM=$(echo "$MATCH" | cut -d'|' -f3)
+            MASK=$(echo "$MATCH" | cut -d'|' -f4)
+            if [ "$MASK" = "root" ]; then
+                SMB_STATE="Shared [$PERM] (Root Masked)"
+            else
+                SMB_STATE="Shared [$PERM]"
+            fi
+        else 
+            SMB_STATE="Offline (Not Shared)"
+        fi
+        
+        QUOTA=$(zfs get -H -o value quota vaultpool/$D_NAME 2>/dev/null || zfs get -H -o value quota fastpool/$D_NAME 2>/dev/null || echo "none")
+        
+        SNAP_V=$(zfs get -H -o value custom:autosnap vaultpool/$D_NAME 2>/dev/null)
+        SNAP_F=$(zfs get -H -o value custom:autosnap fastpool/$D_NAME 2>/dev/null)
+        RET_V=$(zfs get -H -o value custom:keep_days vaultpool/$D_NAME 2>/dev/null)
+        
+        SNAP_DISP="Disabled"
+        if [ "$SNAP_V" = "daily" ] && [ "$SNAP_F" = "daily" ]; then SNAP_DISP="Both Pools (Daily, Keep ${RET_V}d)"
+        elif [ "$SNAP_V" = "daily" ]; then SNAP_DISP="vaultpool Only (Daily, Keep ${RET_V}d)"
+        elif [ "$SNAP_F" = "daily" ]; then SNAP_DISP="fastpool Only (Daily)"
+        fi
+
+        CURRENT_VIS=$(zfs get -H -o value snapdir vaultpool/$D_NAME 2>/dev/null)
+        if [ "$CURRENT_VIS" = "visible" ]; then VIS_DISP="Visible (.zfs and @Snapshots active)"; else VIS_DISP="Hidden"; fi
+
+        echo "================================================="
+        echo "   Managing Dataset: $D_NAME"
+        echo "================================================="
+        echo "   Path Status: $MNT_TYPE ($TARGET_DIR)"
+        echo "   SMB Status : $SMB_STATE"
+        echo "   Quota Limit: $QUOTA"
+        echo "   Snapshots  : $SNAP_DISP"
+        echo "   Visibility : $VIS_DISP"
+        echo "-------------------------------------------------"
+        echo "   1) Modify SMB Network Share"
+        echo "   2) Modify Storage Quota"
+        echo "   3) Manage Snapshots & Visibility"
+        echo "   4) Change ZFS Mount Point"
+        echo "   5) DELETE DATASET"
+        echo "   0) Go Back"
+        echo "================================================="
+        printf "Select an action [0-5]: "
+        read ACTION
+
+        if [ "$ACTION" = "0" ]; then return; fi
+
+        if [ "$ACTION" = "1" ]; then
+            echo ""
+            echo "1) Share as Read / Write (RW)"
+            echo "2) Share as Read Only (RO)"
+            echo "3) Do Not Share (Remove from Network)"
+            printf "Choice [1-3]: "
+            read SMB_ACT
+
+            if [ "$SMB_ACT" = "3" ]; then
+                grep -v "|$TARGET_DIR|" "$SHARE_LIST" > "${SHARE_LIST}.tmp"
+                mv "${SHARE_LIST}.tmp" "$SHARE_LIST"
+                compile_and_reload
+                continue
+            fi
+
+            REQ_PERM=""
+            [ "$SMB_ACT" = "1" ] && REQ_PERM="RW"
+            [ "$SMB_ACT" = "2" ] && REQ_PERM="RO"
+
+            if [ -n "$REQ_PERM" ]; then
+                # ==========================================
+                # Universal Permission & Safety Checker
+                # ==========================================
+                MASK_FLAG="normal"
+                OCTAL=$(stat -c "%a" "$TARGET_DIR" 2>/dev/null || echo "000")
+                O_PERM=$(echo "$OCTAL" | awk '{print substr($1, length($1), 1)}')
+                G_PERM=$(echo "$OCTAL" | awk '{print substr($1, length($1)-1, 1)}')
+                G_OWNER=$(stat -c "%G" "$TARGET_DIR" 2>/dev/null || echo "root")
+
+                CAN_ACCESS=0
+                if [ "$REQ_PERM" = "RW" ]; then
+                    # Checks for Global Write (2, 3, 6, 7) or Valid Group Write
+                    if echo "$O_PERM" | grep -q "[2367]"; then CAN_ACCESS=1; fi
+                    if [ "$G_OWNER" = "storage-rw" ] && echo "$G_PERM" | grep -q "[2367]"; then CAN_ACCESS=1; fi
+                elif [ "$REQ_PERM" = "RO" ]; then
+                    # Checks for Global Read (4, 5, 6, 7) or Valid Group Read
+                    if echo "$O_PERM" | grep -q "[4567]"; then CAN_ACCESS=1; fi
+                    if echo "$G_OWNER" | grep -q "^storage-r" && echo "$G_PERM" | grep -q "[4567]"; then CAN_ACCESS=1; fi
+                fi
+
+                if [ $CAN_ACCESS -eq 0 ]; then
+                    echo ""
+                    printf "\033[1;33m⚠️  SYSTEM PERMISSION CONFLICT DETECTED\033[0m\n"
+                    echo "The strict Linux permissions on this path ($TARGET_DIR) block network access."
+                    echo "To share this, Samba must bypass Linux security using Administrator Masking (force user = root)."
+                    echo ""
+                    printf "\033[1;31m🧨 DANGER: If this is an active hypervisor path (like Docker or libvirt),\n"
+                    printf "modifying system files over a network share can permanently corrupt your containers!\033[0m\n"
+                    echo ""
+                    printf "Do you want to proceed and apply the Root Mask? [y/N]: "
+                    read CONFIRM_MASK
+                    if [ "$CONFIRM_MASK" = "y" ] || [ "$CONFIRM_MASK" = "Y" ]; then
+                        MASK_FLAG="root"
+                    else
+                        echo "❌ Share configuration aborted."
+                        sleep 2
+                        continue
+                    fi
+                fi
+
+                grep -v "|$TARGET_DIR|" "$SHARE_LIST" > "${SHARE_LIST}.tmp"
+                mv "${SHARE_LIST}.tmp" "$SHARE_LIST"
+                echo "${D_NAME}|${TARGET_DIR}|${REQ_PERM}|${MASK_FLAG}" >> "$SHARE_LIST"
+                compile_and_reload
+            fi
+            continue
+        fi
+
+        if [ "$ACTION" = "2" ]; then
+            echo ""
+            printf "Enter new quota (e.g., 500G, 2T) or type 'none' to remove: "
+            read Q_VAL
+            zfs set quota=$Q_VAL vaultpool/$D_NAME >/dev/null 2>&1
+            zfs set quota=$Q_VAL fastpool/$D_NAME >/dev/null 2>&1
+            continue
+        fi
+
+        if [ "$ACTION" = "3" ]; then
+            echo ""
+            echo "1) Take Instant Manual Snapshot"
+            echo "2) Configure Automated Schedule"
+            echo "3) Toggle Network Visibility"
+            echo "4) Delete All Existing Snapshots"
+            echo "0) Go Back"
+            printf "Choice [0-4]: "
+            read S_ACT
+
+            if [ "$S_ACT" = "1" ]; then
+                SNAP_NAME="manual-$(date +%Y-%m-%d_%H%M)"
+                zfs snapshot vaultpool/$D_NAME@$SNAP_NAME >/dev/null 2>&1
+                zfs snapshot fastpool/$D_NAME@$SNAP_NAME >/dev/null 2>&1
+                echo "✅ Created: @$SNAP_NAME"; sleep 2
+            
+            elif [ "$S_ACT" = "2" ]; then
+                echo ""
+                echo "Target: 1) vaultpool (HDD)  2) fastpool (NVMe)  3) Both Pools  0) Cancel"
+                printf "Choice: "
+                read P_CHOICE
+                [ "$P_CHOICE" = "0" ] && continue
+
+                echo "Interval: 1) Daily  2) Disable"
+                printf "Choice: "
+                read INTERVAL
+
+                [ "$P_CHOICE" = "1" ] || [ "$P_CHOICE" = "3" ] && zfs inherit custom:autosnap vaultpool/$D_NAME 2>/dev/null && zfs inherit custom:keep_days vaultpool/$D_NAME 2>/dev/null
+                [ "$P_CHOICE" = "2" ] || [ "$P_CHOICE" = "3" ] && zfs inherit custom:autosnap fastpool/$D_NAME 2>/dev/null && zfs inherit custom:keep_days fastpool/$D_NAME 2>/dev/null
+
+                if [ "$INTERVAL" = "1" ]; then
+                    printf "Keep snapshots for how many days? (e.g., 14, 30): "
+                    read K_DAYS
+                    [ "$P_CHOICE" = "1" ] || [ "$P_CHOICE" = "3" ] && zfs set custom:autosnap=daily vaultpool/$D_NAME && zfs set custom:keep_days=$K_DAYS vaultpool/$D_NAME
+                    [ "$P_CHOICE" = "2" ] || [ "$P_CHOICE" = "3" ] && zfs set custom:autosnap=daily fastpool/$D_NAME && zfs set custom:keep_days=$K_DAYS fastpool/$D_NAME
+                fi
+                continue
+
+            elif [ "$S_ACT" = "3" ]; then
+                if [ "$CURRENT_VIS" = "visible" ]; then
+                    zfs set snapdir=hidden vaultpool/$D_NAME >/dev/null 2>&1
+                    zfs set snapdir=hidden fastpool/$D_NAME >/dev/null 2>&1
+                    rm -f "$TARGET_DIR/@Snapshots" >/dev/null 2>&1
+                    CHANGES_PENDING=1
+                else
+                    zfs set snapdir=visible vaultpool/$D_NAME >/dev/null 2>&1
+                    zfs set snapdir=visible fastpool/$D_NAME >/dev/null 2>&1
+                    ln -s .zfs/snapshot "$TARGET_DIR/@Snapshots" >/dev/null 2>&1
+                    CHANGES_PENDING=1
+                fi
+                continue
+                
+            elif [ "$S_ACT" = "4" ]; then
+                echo ""
+                SNAP_COUNT_V=$(zfs list -H -t snapshot -o name | grep "^vaultpool/$D_NAME@" | wc -l)
+                SNAP_COUNT_F=$(zfs list -H -t snapshot -o name | grep "^fastpool/$D_NAME@" | wc -l)
+                TOTAL_SNAPS=$((SNAP_COUNT_V + SNAP_COUNT_F))
+
+                if [ "$TOTAL_SNAPS" -eq 0 ]; then
+                    echo "No snapshots found for '$D_NAME'."
+                    sleep 2; continue
+                fi
+
+                echo "Found $TOTAL_SNAPS total snapshot(s) across both pools for '$D_NAME'."
+                printf "⚠️  Type 'WIPE' to permanently delete ALL snapshots for this dataset: "
+                read CONFIRM_SNAP
+                if [ "$CONFIRM_SNAP" = "WIPE" ]; then
+                    echo "🧹 Erasing snapshots..."
+                    for snap in $(zfs list -H -t snapshot -o name | grep "^vaultpool/$D_NAME@"); do zfs destroy "$snap"; done
+                    for snap in $(zfs list -H -t snapshot -o name | grep "^fastpool/$D_NAME@"); do zfs destroy "$snap"; done
+                    echo "✅ All snapshots destroyed. Capacity freed."
+                    CHANGES_PENDING=1
+                    sleep 2
+                else
+                    echo "❌ Aborted."
+                    sleep 1
+                fi
+                continue
+            fi
+        fi
+
+        if [ "$ACTION" = "4" ]; then
+            echo ""
+            echo "Current Active Path: $TARGET_DIR ($MNT_TYPE)"
+            echo "⚠️  Note: Changing mount points while services are active can cause severe errors."
+            echo ""
+            echo "💡 Common Direct ZFS Mount Paths:"
+            echo "   /var/lib/docker      (Docker Engine Root)"
+            echo "   /var/lib/containerd  (Containerd Root)"
+            echo "   /var/lib/libvirt     (Virtual Machine Images)"
+            echo "   /var/lib/postgresql  (Database Storage)"
+            printf "Enter new absolute path (or type 'default' to revert to MergerFS pooling): "
+            read NEW_MNT
+
+            if [ "$NEW_MNT" = "default" ]; then
+                ACTUAL_NEW_MNT="/mnt/$D_NAME"
+                zfs inherit mountpoint vaultpool/$D_NAME 2>/dev/null
+                zfs inherit mountpoint fastpool/$D_NAME 2>/dev/null
+                CHANGES_PENDING=1
+            elif [ -n "$NEW_MNT" ]; then
+                ACTUAL_NEW_MNT="$NEW_MNT"
+                if zfs list vaultpool/$D_NAME >/dev/null 2>&1 && zfs list fastpool/$D_NAME >/dev/null 2>&1; then
+                    echo "❌ Error: This dataset exists on BOTH pools. Cache-Tiered datasets cannot share a custom ZFS mount."
+                    sleep 4; continue
+                fi
+                mkdir -p "$ACTUAL_NEW_MNT"
+                lbu include add "$ACTUAL_NEW_MNT"
+                lbu exclude add "${ACTUAL_NEW_MNT}/*"
+                zfs set mountpoint=$ACTUAL_NEW_MNT vaultpool/$D_NAME 2>/dev/null || zfs set mountpoint=$ACTUAL_NEW_MNT fastpool/$D_NAME 2>/dev/null
+                CHANGES_PENDING=1
+            fi
+
+            # Auto-Migrate the network share definition if the path changes
+            if [ -n "$NEW_MNT" ] && [ "$SMB_STATE" != "Offline (Not Shared)" ]; then
+                grep -v "|$TARGET_DIR|" "$SHARE_LIST" > "${SHARE_LIST}.tmp"
+                mv "${SHARE_LIST}.tmp" "$SHARE_LIST"
+                echo "${D_NAME}|${ACTUAL_NEW_MNT}|${PERM}|${MASK}" >> "$SHARE_LIST"
+                compile_and_reload
+            fi
+            continue
+        fi
+
+        if [ "$ACTION" = "5" ]; then
+            delete_dataset "$D_NAME" "$TARGET_DIR"
+            if [ $? -eq 0 ]; then return; else sleep 3; fi
+        fi
+    done
+}
+
+# ==========================================
+# Core Operational Loop & Dashboard
+# ==========================================
+
+while true; do
+    clear
+    echo "=========================================================================="
+    echo "                 Unified ZFS & Network Storage Manager      "
+    echo "=========================================================================="
+    echo "   Logical ZFS Datasets:"
+
+    DS_LIST=$(zfs list -H -o name -t filesystem | grep '/' | cut -d'/' -f2 | sort | uniq)
+    
+    if [ -z "$DS_LIST" ]; then
+        echo "   (No datasets found)"
+        set -- 
+    else
+        set -- $DS_LIST
+        i=1
+        for DIR_NAME in "$@"; do
+            RESOLVED=$(resolve_target_dir "$DIR_NAME")
+            TARGET_DIR=$(echo "$RESOLVED" | cut -d'|' -f1)
+            MNT_TYPE=$(echo "$RESOLVED" | cut -d'|' -f2)
+
+            MATCH=$(grep "|$TARGET_DIR|" "$SHARE_LIST")
+            if [ -n "$MATCH" ]; then 
+                PERM=$(echo "$MATCH" | cut -d'|' -f3)
+                MASK=$(echo "$MATCH" | cut -d'|' -f4)
+                if [ "$MASK" = "root" ]; then
+                    SMB_STATE="Shared [$PERM] (Root Masked)"
+                else
+                    SMB_STATE="Shared [$PERM]"
+                fi
+            else 
+                SMB_STATE="Offline"
+            fi
+            
+            QUOTA=$(zfs get -H -o value quota vaultpool/$DIR_NAME 2>/dev/null)
+            [ "$QUOTA" = "none" ] || [ -z "$QUOTA" ] && Q_DISP="" || Q_DISP="[Max: $QUOTA]"
+            
+            SNAP_V=$(zfs get -H -o value custom:autosnap vaultpool/$DIR_NAME 2>/dev/null)
+            SNAP_F=$(zfs get -H -o value custom:autosnap fastpool/$DIR_NAME 2>/dev/null)
+            S_DISP=""
+            if [ "$SNAP_V" = "daily" ] && [ "$SNAP_F" = "daily" ]; then S_DISP="[Snap: Both]"
+            elif [ "$SNAP_V" = "daily" ]; then S_DISP="[Snap: HDD]"
+            elif [ "$SNAP_F" = "daily" ]; then S_DISP="[Snap: NVMe]"; fi
+
+            printf "  %2d) %-18s %-12s %-15s -> %s\n" "$i" "$DIR_NAME" "$Q_DISP" "$S_DISP" "$SMB_STATE"
+            printf "      └─ %-12s : %s\n\n" "$MNT_TYPE" "$TARGET_DIR"
+            i=$((i + 1))
+        done
+    fi
+    echo "--------------------------------------------------------------------------"
+    echo "   N) Create New Dataset  "
+    echo "   U) Manage Samba Users"
+    echo "   X) Exit Dashboard"
+    echo "=========================================================================="
+    printf "Select dataset to manage, or action [N/U/X]: "
+    read OPTION
+
+    if [ "$OPTION" = "x" ] || [ "$OPTION" = "X" ]; then 
+        echo ""
+        if [ "$CHANGES_PENDING" -eq 1 ]; then
+            printf "\033[1;33m⚠️  MEMORY WARNING: You made structural changes during this session.\033[0m\n"
+            printf "\033[1;37m   You MUST run 'lbu commit -d' to permanently save them to your boot media!\033[0m\n\n"
+        fi
+        echo "Exiting Dashboard."
+        exit 0; 
+    fi
+
+    if [ "$OPTION" = "n" ] || [ "$OPTION" = "N" ]; then create_dataset; printf "\nPress Enter..."; read DUMMY; continue; fi
+    
+    if [ "$OPTION" = "u" ] || [ "$OPTION" = "U" ]; then 
+        if command -v manage-share-users >/dev/null 2>&1; then
+            manage-share-users
+        elif [ -f "/usr/local/bin/manage-share-users" ]; then
+            /usr/local/bin/manage-share-users
+        else
+            echo "❌ Error: manage-share-users script not found."
+            sleep 2
+        fi
+        continue
+    fi
+
+    if [ "$OPTION" -eq "$OPTION" ] 2>/dev/null && [ "$OPTION" -ge 1 ] && [ "$OPTION" -le "$#" ]; then
+        eval DIR_NAME=\${$OPTION}
+        manage_dataset_menu "$DIR_NAME"
+    else
+        echo "❌ Invalid selection."
+        sleep 1
+    fi
+done

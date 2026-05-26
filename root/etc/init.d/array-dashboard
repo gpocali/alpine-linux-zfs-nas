@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+
+name="ZFS Array Dashboard"
+description="Lightweight web server for the storage telemetry dashboard"
+
+# The executable and the exact arguments you tested earlier
+command="/usr/bin/darkhttpd"
+command_args="/var/www/dashboard --port 8080"
+
+# Tell OpenRC to manage the backgrounding automatically
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+# Ensure the network is up before trying to bind to port 8080
+depend() {
+    need net
+}

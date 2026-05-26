@@ -1,0 +1,6 @@
+af_packet
+ipv6
+tpm_tis
+tpm_tis_spi
+tpm_crb
+fuse

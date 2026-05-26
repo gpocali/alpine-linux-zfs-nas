@@ -1,0 +1,101 @@
+#!/bin/ash
+
+WEB_ROOT="/var/www/dashboard"
+OUT_FILE="$WEB_ROOT/zfs-telemetry.json"
+TMP_FILE="/tmp/zfs-telemetry.tmp"
+SHARE_LIST="/etc/samba/shares.list"
+
+echo "{" > "$TMP_FILE"
+echo "  \"updated\": \"$(date +'%Y-%m-%d %H:%M:%S')\"," >> "$TMP_FILE"
+
+# 1. Pool Infrastructure
+echo "  \"pools\": [" >> "$TMP_FILE"
+FIRST_POOL=1
+zpool list -H -o name,size,alloc,free,capacity,health | while read -r name size alloc free cap health; do
+    if [ $FIRST_POOL -eq 1 ]; then FIRST_POOL=0; else echo "    ," >> "$TMP_FILE"; fi
+    cat <<EOF >> "$TMP_FILE"
+    {
+      "pool": "$name",
+      "size": "$size",
+      "allocated": "$alloc",
+      "free": "$free",
+      "capacity": "$cap",
+      "health": "$health",
+      "disks": [
+EOF
+    
+    FIRST_DISK=1
+    # Extract the physical drive names from zpool status
+    for disk in $(zpool status "$name" | awk '/ata+|nvme[0-9]+/{print $1}'); do
+        disk_clean=$(basename "$disk")
+        # Strip partition numbers so hdparm targets the raw drive enclosure (e.g., sda1 -> sda)
+        base_disk=$(echo "$disk_clean" | sed -E 's/[0-9]+$//')
+        
+        if [[ "$base_disk" != "errors:" ]]; then
+            # Check sleep state (safely ignores NVMe drives returning errors)
+            if hdparm -C "/dev/disk/by-id/$base_disk" 2>/dev/null | grep -qi "standby"; then
+                D_STATE="Standby"
+            else
+                D_STATE="Active"
+            fi
+
+            if [ $FIRST_DISK -eq 1 ]; then FIRST_DISK=0; else echo "        ," >> "$TMP_FILE"; fi
+            cat <<EOF >> "$TMP_FILE"
+            {
+               "id": "$disk_clean",
+               "state": "$D_STATE"
+            }
+EOF
+        fi
+    done
+    
+    echo "      ]" >> "$TMP_FILE"
+    echo "    }" >> "$TMP_FILE"
+done
+echo "  ]," >> "$TMP_FILE"
+
+# 2. Dataset Logical Volumes (Now with Network & Backup Telemetry)
+echo "  \"datasets\": [" >> "$TMP_FILE"
+FIRST_DS=1
+zfs list -H -o name,used,available,quota,compressratio -t filesystem | while read -r name used avail quota comp; do
+    
+    # Extract the base folder name to check network shares
+    DS_BASE=$(basename "$name")
+    MNT_PATH="/mnt/$DS_BASE"
+    
+    # Check if this dataset exists in our active Samba share list
+    SHARE_MATCH=$(grep "|$MNT_PATH|" "$SHARE_LIST" 2>/dev/null)
+    if [ -n "$SHARE_MATCH" ]; then
+        SMB_STATE="Active"
+        SMB_PERM=$(echo "$SHARE_MATCH" | cut -d'|' -f3)
+    else
+        SMB_STATE="Offline"
+        SMB_PERM="-"
+    fi
+
+    # Read our custom ZFS automated snapshot properties
+    SNAP_FREQ=$(zfs get -H -o value custom:autosnap "$name" 2>/dev/null)
+    SNAP_KEEP=$(zfs get -H -o value custom:keep_days "$name" 2>/dev/null)
+    
+    [ "$SNAP_FREQ" = "-" ] && SNAP_FREQ="Disabled"
+    [ "$SNAP_KEEP" = "-" ] && SNAP_KEEP="0"
+
+    if [ $FIRST_DS -eq 1 ]; then FIRST_DS=0; else echo "    ," >> "$TMP_FILE"; fi
+    cat <<EOF >> "$TMP_FILE"
+    {
+      "dataset": "$name",
+      "used": "$used",
+      "available": "$avail",
+      "quota": "$quota",
+      "compression": "$comp",
+      "smb_state": "$SMB_STATE",
+      "smb_perm": "$SMB_PERM",
+      "snap_freq": "$SNAP_FREQ",
+      "snap_retention": "$SNAP_KEEP"
+    }
+EOF
+done
+echo "  ]" >> "$TMP_FILE"
+echo "}" >> "$TMP_FILE"
+
+mv "$TMP_FILE" "$OUT_FILE"

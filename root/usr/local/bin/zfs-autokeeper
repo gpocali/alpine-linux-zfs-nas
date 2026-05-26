@@ -1,0 +1,45 @@
+#!/bin/ash
+
+echo "======================================"
+echo " Starting ZFS Autokeeper Lifecycle"
+echo " Time: $(date)"
+echo "======================================"
+
+# Loop through ALL datasets on the system
+for ds in $(zfs list -H -o name -t filesystem); do
+    
+    # Read our custom properties (returns "-" if not set)
+    SNAP_RULE=$(zfs get -H -o value custom:autosnap "$ds")
+    KEEP_DAYS=$(zfs get -H -o value custom:keep_days "$ds")
+
+    if [ "$SNAP_RULE" = "daily" ]; then
+        SNAP_NAME="auto-daily-$(date +%Y-%m-%d_%H%M)"
+        
+        # Check if we already took one today to prevent spam
+        if ! zfs list -t snapshot -o name | grep -q "${ds}@auto-daily-$(date +%Y-%m-%d)"; then
+            zfs snapshot "${ds}@${SNAP_NAME}"
+            echo "📸 Created: ${ds}@${SNAP_NAME}"
+        fi
+    fi
+
+    # Pruning Logic
+    if [ "$KEEP_DAYS" != "-" ] && [ "$KEEP_DAYS" -gt 0 ] 2>/dev/null; then
+        
+        # Calculate the Unix timestamp of the expiration horizon
+        NOW=$(date +%s)
+        EXPIRE_TIME=$(( NOW - (KEEP_DAYS * 86400) ))
+
+        # Find all automated snapshots for this dataset and their exact creation timestamps
+        zfs list -H -o name,creation -p -t snapshot -d 1 "$ds" | grep "@auto-" | while read -r snap_name snap_time; do
+            
+            if [ "$snap_time" -lt "$EXPIRE_TIME" ]; then
+                zfs destroy "$snap_name"
+                echo "🗑️  Pruned Expired Snapshot: $snap_name (Older than $KEEP_DAYS days)"
+            fi
+            
+        done
+    fi
+done
+
+echo "======================================"
+echo " Autokeeper Complete."

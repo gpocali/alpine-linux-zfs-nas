@@ -1,0 +1,50 @@
+#!/bin/ash
+
+ACTION=$1
+
+# Ensure the user provided a command
+if [ -z "$ACTION" ]; then
+    echo "Usage: array-control {status|down|up}"
+    exit 1
+fi
+
+echo "======================================"
+echo "    Exos Array Control: $ACTION       "
+echo "======================================"
+
+for drive in /dev/disk/by-id/ata-ST28000NM000C*; do
+    # Skip partition symlinks (we only want to command the whole disk)
+    if echo "$drive" | grep -q -- "-part"; then
+        continue
+    fi
+
+    # Grab just the serial number portion for cleaner terminal output
+    DRIVE_ID=$(basename "$drive" | sed 's/ata-ST28000NM000C-//')
+
+    case "$ACTION" in
+        status)
+            # Use smartctl to check power mode WITHOUT waking the drive
+            if smartctl -i -n standby "$drive" | grep -q "STANDBY"; then
+                echo " [ ZZZ ] $DRIVE_ID is asleep (Standby)."
+            else
+                echo " [ ON  ] $DRIVE_ID is spinning (Active)."
+            fi
+            ;;
+        down)
+            echo "Spinning down $DRIVE_ID..."
+            hdparm -y "$drive" > /dev/null 2>&1
+            ;;
+        up)
+            echo "Waking up $DRIVE_ID..."
+            # Querying the drive's hardware info forces the motor to spin up
+            hdparm -I "$drive" > /dev/null 2>&1
+            ;;
+        *)
+            echo "Error: Unknown command."
+            echo "Usage: array-control {status|down|up}"
+            exit 1
+            ;;
+    esac
+done
+
+echo "======================================"

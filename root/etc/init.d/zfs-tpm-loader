@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+
+name="ZFS TPM Key Loader"
+description="Unseals ZFS master key from TPM and unlocks vaultpool"
+
+depend() {
+    after zfs-import
+    before zfs-mount
+}
+
+start() {
+    ebegin "Unsealing ZFS key from Asus TPM"
+    
+    # Decrypt the sealed payload into volatile RAM
+    if clevis decrypt < /etc/zfs/tpm-sealed.jwe > /tmp/unsealed.key 2>/dev/null; then
+        # Load the key into vaultpool
+        zfs load-key vaultpool < /tmp/unsealed.key
+        rm -f /tmp/unsealed.key
+        eend 0
+    else
+        eend 1 "Failed to unseal key from TPM!"
+    fi
+}
+

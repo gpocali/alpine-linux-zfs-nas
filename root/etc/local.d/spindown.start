@@ -1,0 +1,12 @@
+#!/bin/ash
+
+# Wait a few seconds to ensure all drives are fully initialized
+sleep 10
+
+# Loop through all 28TB Seagate Exos drives and set a 1-hour idle spindown
+for drive in /dev/disk/by-id/ata-ST28000NM000C*; do
+    # Only apply to the raw block device, not the individual partitons (-part1, -part9)
+    if ! echo "$drive" | grep -q -- "-part"; then
+        hdparm -S 242 "$drive"
+    fi
+done

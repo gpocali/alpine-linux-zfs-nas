@@ -1,0 +1,19 @@
+# do daily/weekly/monthly maintenance
+# min	hour	day	month	weekday	command
+*/15	*	*	*	*	run-parts /etc/periodic/15min
+0	*	*	*	*	run-parts /etc/periodic/hourly
+0	2	*	*	*	run-parts /etc/periodic/daily
+0	3	*	*	6	run-parts /etc/periodic/weekly
+0	5	1	*	*	run-parts /etc/periodic/monthly
+#*	*	*	*	*	/usr/local/bin/generate-telemetry.sh > /dev/null 2>&1
+
+# The Watchdog: Runs every 15 minutes, checks if capacity > 80%, moves data if true
+*/15 * * * * /usr/local/bin/cache-mover.sh check >> /var/log/cache-mover.log 2>&1
+
+# The Nightly Sweep: Runs at 2:00 AM every day, forces a move regardless of capacity
+0 2 * * * /usr/local/bin/cache-mover.sh force >> /var/log/cache-mover.log 2>&1
+
+5 0 * * * /usr/local/bin/zfs-autokeeper >> /var/log/zfs-autokeeper.log 2>&1
+
+* * * * * /usr/local/bin/generate-telemetry >/dev/null 2>&1
+

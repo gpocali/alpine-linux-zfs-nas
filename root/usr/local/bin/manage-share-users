@@ -1,0 +1,143 @@
+#!/bin/ash
+
+show_menu() {
+    echo "======================================"
+    echo "    Samba Share User Management      "
+    echo "======================================"
+    echo "1) List current storage users"
+    echo "2) Add a new storage user"
+    echo "3) Change user permissions (RO/RW)"
+    echo "4) Delete a storage user"
+    echo "5) Exit"
+    echo "======================================"
+    printf "Select an option [1-5]: "
+}
+
+list_users() {
+    echo "--- Read/Write Users (storage-rw) ---"
+    getent group storage-rw | cut -d: -f4 | tr ',' '\n' | awk 'NF' | sed 's/^/  - /'
+    echo ""
+    echo "--- Read-Only Users (storage-ro) ---"
+    getent group storage-ro | cut -d: -f4 | tr ',' '\n' | awk 'NF' | sed 's/^/  - /'
+    echo "--------------------------------------"
+}
+
+# Dynamic Helper: Generates a numbered list of users for selection
+select_user() {
+    USERNAME=""
+    # Extract users from both groups, split by commas, remove empty lines, and sort alphabetically
+    USER_LIST=$(awk -F: '/^storage-(rw|ro):/ {print $4}' /etc/group | tr ',' '\n' | awk 'NF' | sort | uniq)
+    
+    if [ -z "$USER_LIST" ]; then
+        echo "❌ No storage users found."
+        return
+    fi
+
+    # Load the user list into positional parameters ($1, $2, etc.) to simulate an array
+    set -- $USER_LIST
+    
+    echo "Current Storage Users:"
+    i=1
+    for u in "$@"; do
+        echo "  $i) $u"
+        i=$((i + 1))
+    done
+    echo "  0) Cancel"
+    
+    printf "Select a user [0-$#]: "
+    read NUM_CHOICE
+
+    if [ "$NUM_CHOICE" = "0" ]; then
+        return
+    fi
+
+    # Validate the input is an integer and within the valid range
+    if ! [ "$NUM_CHOICE" -eq "$NUM_CHOICE" ] 2>/dev/null || [ "$NUM_CHOICE" -lt 1 ] || [ "$NUM_CHOICE" -gt "$#" ]; then
+        echo "❌ Invalid selection."
+        return
+    fi
+
+    # Dynamically extract the selected username
+    eval USERNAME=\${$NUM_CHOICE}
+}
+
+add_user() {
+    printf "Enter new username: "
+    read USER_INPUT
+    if id "$USER_INPUT" >/dev/null 2>&1; then
+        echo "❌ Error: User '$USER_INPUT' already exists."
+        return
+    fi
+
+    adduser -D -H -s /sbin/nologin "$USER_INPUT"
+    
+    echo "Set network password for $USER_INPUT:"
+    smbpasswd -a "$USER_INPUT"
+    
+    addgroup "$USER_INPUT" storage-ro
+    echo "✅ User '$USER_INPUT' created and set to Read-Only."
+}
+
+change_perms() {
+    select_user
+    [ -z "$USERNAME" ] && return
+
+    echo ""
+    echo "Select permission level for '$USERNAME':"
+    echo "1) Read / Write"
+    echo "2) Read Only"
+    printf "Choice [1-2]: "
+    read CHOICE
+
+    if [ "$CHOICE" = "1" ]; then
+        delgroup "$USERNAME" storage-ro 2>/dev/null
+        addgroup "$USERNAME" storage-rw 2>/dev/null
+        echo "✅ '$USERNAME' is now Read/Write."
+    elif [ "$CHOICE" = "2" ]; then
+        delgroup "$USERNAME" storage-rw 2>/dev/null
+        addgroup "$USERNAME" storage-ro 2>/dev/null
+        echo "✅ '$USERNAME' is now Read-Only."
+    else
+        echo "❌ Invalid selection."
+    fi
+}
+
+delete_user() {
+    select_user
+    [ -z "$USERNAME" ] && return
+
+    echo ""
+    printf "⚠️  Are you sure you want to delete '$USERNAME'? [y/N]: "
+    read CONFIRM
+    
+    if [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ]; then
+        smbpasswd -x "$USERNAME" >/dev/null 2>&1
+        deluser "$USERNAME"
+        echo "✅ User '$USERNAME' completely removed."
+    else
+        echo "❌ Deletion canceled."
+    fi
+}
+
+# ==========================================
+# Core Operational Loop
+# ==========================================
+
+clear
+show_menu
+
+while read OPTION; do
+    clear 
+    
+    case "$OPTION" in
+        1) list_users ;;
+        2) add_user ;;
+        3) change_perms ;;
+        4) delete_user ;;
+        5) echo "Exiting."; exit 0 ;;
+        *) echo "❌ Invalid option. Please select 1-5." ;;
+    esac
+    
+    echo ""
+    show_menu
+done

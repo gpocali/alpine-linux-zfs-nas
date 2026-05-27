@@ -9,10 +9,10 @@ command="/usr/bin/mergerfs"
 # This dynamically routes data based on where the ZFS datasets actually exist.
 
 # --> FUTURE STATE (Uncomment when Sabrent NVMe fastpool is built):
-# command_args="-f -o rw,use_ino,allow_other,func.getattr=newest,category.action=all,category.create=epff,cache.files=partial,dropcacheonclose=true /fastpool:/vaultpool /mnt"
+command_args="-f -o rw,use_ino,allow_other,func.getattr=newest,category.action=all,category.create=epff,cache.files=partial,dropcacheonclose=true /fastpool:/vaultpool /mnt"
 
 # --> CURRENT STATE (Runs directly off the Exos array today):
-command_args="-f -o rw,use_ino,allow_other,func.getattr=newest,category.action=all,category.create=epff,cache.files=partial,dropcacheonclose=true /vaultpool /mnt"
+# command_args="-f -o rw,use_ino,allow_other,func.getattr=newest,category.action=all,category.create=epff,cache.files=partial,dropcacheonclose=true /vaultpool /mnt"
 
 command_background="true"
 pidfile="/run/${RC_SVCNAME}.pid"

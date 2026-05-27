@@ -15,6 +15,7 @@ start() {
     if clevis decrypt < /etc/zfs/tpm-sealed.jwe > /tmp/unsealed.key 2>/dev/null; then
         # Load the key into vaultpool
         zfs load-key vaultpool < /tmp/unsealed.key
+		zfs load-key fastpool < /tmp/unsealed.key
         rm -f /tmp/unsealed.key
         eend 0
     else

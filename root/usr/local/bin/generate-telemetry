@@ -26,10 +26,11 @@ EOF
     
     FIRST_DISK=1
     # Extract the physical drive names from zpool status
-    for disk in $(zpool status "$name" | awk '/ata+|nvme[0-9]+/{print $1}'); do
+    for disk in $(zpool status "$name" | awk '/ata-+|nvme[0-9]+/{print $1}'); do
         disk_clean=$(basename "$disk")
         # Strip partition numbers so hdparm targets the raw drive enclosure (e.g., sda1 -> sda)
-        base_disk=$(echo "$disk_clean" | sed -E 's/[0-9]+$//')
+        # base_disk=$(echo "$disk_clean" | sed -E 's/[0-9]+$//')
+        base_disk="$disk_clean"
         
         if [[ "$base_disk" != "errors:" ]]; then
             # Check sleep state (safely ignores NVMe drives returning errors)

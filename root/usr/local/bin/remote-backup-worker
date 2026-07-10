@@ -1,0 +1,112 @@
+#!/bin/ash
+
+ALIAS=$1
+MODE=$2
+
+if [ -z "$ALIAS" ]; then
+    echo "Error: No share alias provided."
+    exit 1
+fi
+
+# ==========================================
+# Concurrency Lock & Stale Process Detection
+# ==========================================
+LOCK_DIR="/tmp/remote_backup_${ALIAS}.lock"
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    if [ -f "$LOCK_DIR/pid" ]; then
+        LOCK_PID=$(cat "$LOCK_DIR/pid")
+        if ! kill -0 "$LOCK_PID" 2>/dev/null; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - ⚠️  Stale lock detected for $ALIAS (PID $LOCK_PID is dead). Clearing."
+            rm -rf "$LOCK_DIR"
+            if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - ❌ CRITICAL: Failed to recreate lock. Exiting."
+                exit 1
+            fi
+        else
+            if [ "$MODE" = "verbose" ]; then
+                echo "⏳ SKIPPED: Backup '$ALIAS' is already actively syncing in the background (PID: $LOCK_PID)."
+            fi
+            exit 0
+        fi
+    else
+        if [ "$MODE" = "verbose" ]; then
+            echo "⏳ SKIPPED: Backup '$ALIAS' is currently spinning up."
+        fi
+        exit 0
+    fi
+fi
+
+echo $$ > "$LOCK_DIR/pid"
+trap 'rm -rf "$LOCK_DIR"; exit' INT TERM EXIT
+# ==========================================
+
+CONFIG_DIR="/etc/remote-backups/$ALIAS"
+if [ ! -f "$CONFIG_DIR/config.sh" ]; then
+    echo "Error: Configuration for $ALIAS not found."
+    exit 1
+fi
+
+source "$CONFIG_DIR/config.sh"
+MOUNT_POINT="/remote/$ALIAS"
+
+mkdir -p "$MOUNT_POINT"
+
+# Pre-flight check: Clear any pre-existing or stale mounts from an interrupted run
+if mountpoint -q "$MOUNT_POINT"; then
+    if [ "$MODE" = "verbose" ]; then
+        echo "⚠️  Stale mount detected at $MOUNT_POINT. Unmounting to ensure a fresh connection..."
+    fi
+    umount "$MOUNT_POINT" 2>/dev/null || umount -l "$MOUNT_POINT" 2>/dev/null
+    sleep 1
+fi
+
+# Build credentials in a secure temporary RAM disk
+TMPFS_DIR=$(mktemp -d /dev/shm/smb_cred_XXXXXX)
+CRED_FILE="$TMPFS_DIR/credentials"
+
+echo "username=$SMB_USER" > "$CRED_FILE"
+printf "password=" >> "$CRED_FILE"
+
+# Unseal password from TPM
+tpm2_createprimary -c primary.ctx 2>/dev/null
+tpm2_load -C primary.ctx -u "$CONFIG_DIR/pass.pub" -r "$CONFIG_DIR/pass.priv" -c key.ctx
+tpm2_unseal -c key.ctx >> "$CRED_FILE"
+
+# Mount the remote share read-only
+if ! mount -t cifs "$SMB_PATH" "$MOUNT_POINT" -o credentials="$CRED_FILE",ro; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - ❌ Failed to mount $SMB_PATH"
+    rm -rf "$TMPFS_DIR" primary.ctx key.ctx
+    exit 1
+fi
+
+# Immediately scrub plaintext credentials and context files
+rm -rf "$TMPFS_DIR" primary.ctx key.ctx
+
+# Direct flat routing
+TARGET_PATH="$DESTINATION/$ALIAS"
+
+mkdir -p "$TARGET_PATH"
+
+set -o pipefail
+echo "$(date '+%Y-%m-%d %H:%M:%S') - ⚙️  Starting incremental rsync mirror for $ALIAS..."
+
+# If executed manually from the dashboard, show raw output.
+# Otherwise (cron job), pipe to tr to strip carriage returns to prevent log inflation.
+if [ "$MODE" = "verbose" ]; then
+    RSYNC_CMD="rsync -gloptruv --progress --exclude 'System Volume Information' --exclude '\$RECYCLE.BIN' --delete --delete-excluded \"$MOUNT_POINT/\" \"$TARGET_PATH/\""
+    eval "$RSYNC_CMD"
+else
+    RSYNC_CMD="rsync -gloptruv --progress --exclude 'System Volume Information' --exclude '\$RECYCLE.BIN' --delete --delete-excluded \"$MOUNT_POINT/\" \"$TARGET_PATH/\" | tr -d '\r'"
+    eval "$RSYNC_CMD"
+fi
+
+# Record exit status
+if [ $? -eq 0 ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - ✅ Backup complete."
+    date '+%Y-%m-%d %H:%M:%S' > "$CONFIG_DIR/last_success"
+else
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - ❌ Backup encountered errors."
+fi
+
+umount "$MOUNT_POINT"

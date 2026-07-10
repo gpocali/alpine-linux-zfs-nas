@@ -96,6 +96,44 @@ zfs list -H -o name,used,available,quota,compressratio -t filesystem | while rea
     }
 EOF
 done
+# ... (existing dataset loop ends here)
+echo "  ]," >> "$TMP_FILE"
+
+# 3. Remote SMB Mirror Telemetry
+echo "  \"remote_backups\": [" >> "$TMP_FILE"
+FIRST_RB=1
+if [ -d "/etc/remote-backups" ]; then
+    for dir in /etc/remote-backups/*; do
+        [ -d "$dir" ] || continue
+        ALIAS=$(basename "$dir")
+        
+        source "$dir/config.sh" 2>/dev/null
+        
+        if ps | grep -v grep | grep -q "remote-backup-worker $ALIAS"; then
+            STATE="Running"
+        else
+            STATE="Idle"
+        fi
+
+        # Extract the last successful run time
+        if [ -f "$dir/last_success" ]; then
+            LAST_RUN=$(cat "$dir/last_success")
+        else
+            LAST_RUN="Never"
+        fi
+
+        if [ $FIRST_RB -eq 1 ]; then FIRST_RB=0; else echo "    ," >> "$TMP_FILE"; fi
+        cat <<EOF >> "$TMP_FILE"
+        {
+          "alias": "$ALIAS",
+          "source": "$SMB_PATH",
+          "destination": "$DESTINATION",
+          "state": "$STATE",
+          "last_run": "$LAST_RUN"
+        }
+EOF
+    done
+fi
 echo "  ]" >> "$TMP_FILE"
 echo "}" >> "$TMP_FILE"
 

@@ -105,6 +105,10 @@
         .meta-badge.active-snap { border-color: #2f9e44; color: #40c057; }
 
         .timestamp { color: #888; font-size: 0.85em; text-align: right; margin-top: 40px; }
+		
+		@keyframes spin {
+            100% { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body>
@@ -119,6 +123,11 @@
     <div class="section-title">ZFS Datasets & Logical Volumes</div>
     <div class="grid-container" id="datasets-container">
         <p style="color: #888;">Loading logical volumes...</p>
+    </div>
+
+    <div class="section-title">Remote SMB Mirrors</div>
+    <div class="grid-container" id="backups-container">
+        <p style="color: #888;">Loading mirror configurations...</p>
     </div>
 
     <div class="timestamp" id="last-updated"></div>
@@ -271,6 +280,50 @@
                 `;
                 datasetsContainer.appendChild(card);
             });
+			
+			// 3. Process and Render Remote SMB Backups
+            const backupsContainer = document.getElementById('backups-container');
+            backupsContainer.innerHTML = '';
+
+            if (data.remote_backups && data.remote_backups.length > 0) {
+                data.remote_backups.forEach(backup => {
+                    const card = document.createElement('div');
+                    card.className = 'telemetry-card';
+
+                    // Visual styling logic for the running state
+                    const isRunning = backup.state === 'Running';
+                    const badgeBg = isRunning ? '#2f9e44' : '#444444';
+                    const badgeText = isRunning ? '🔄 Syncing' : '💤 Idle';
+                    const iconAnim = isRunning ? 'spin 2s linear infinite' : 'none';
+
+                    card.innerHTML = `
+                        <div class="card-header">
+                            <span class="card-title" style="font-size:1.1em; color:#e0e0e0;">${backup.alias}</span>
+                            <span class="health-badge" style="background: ${badgeBg}; color: #fff; display: flex; align-items: center; gap: 5px;">
+                                <span style="animation: ${iconAnim}; display: inline-block;">${isRunning ? '🔄' : '💤'}</span> 
+                                ${isRunning ? 'Syncing' : 'Idle'}
+                            </span>
+                        </div>
+                        <div>
+                            <div class="stat-label" style="margin-bottom: 8px;">
+                                <span>Source:</span>
+                                <span class="stat-value" style="font-size: 0.85em; color: #a6a7ab;">${backup.source}</span>
+                            </div>
+                            <div class="stat-label" style="margin-bottom: 8px;">
+                                <span>Target:</span>
+                                <span class="stat-value" style="font-size: 0.85em; color: #a6a7ab;">${backup.destination}</span>
+                            </div>
+                            <div class="stat-label" style="border-top: 1px solid #333; padding-top: 8px; margin-top: 8px;">
+                                <span>Last Success:</span>
+                                <span class="stat-value" style="font-size: 0.85em; color: ${backup.last_run === 'Never' ? '#e03131' : '#40c057'};">${backup.last_run}</span>
+                            </div>
+                        </div>
+                    `;
+                    backupsContainer.appendChild(card);
+                });
+            } else {
+                backupsContainer.innerHTML = '<p style="color: #666; font-style: italic; grid-column: 1/-1;">No remote mirrors currently configured.</p>';
+            }
         }
 
         // Initialize synchronization loops

@@ -22,19 +22,75 @@ if ! apk info -e cifs-utils rsync tpm2-tools >/dev/null 2>&1; then
     sleep 2
 fi
 
+prompt_cron_schedule() {
+    echo ""
+    echo "Select Backup Frequency:"
+    echo "  1) Hourly  (0 * * * *)"
+    echo "  2) Daily   (0 0 * * *)"
+    echo "  3) Weekly  (0 0 * * 0)"
+    echo "  4) Custom  (Enter raw cron string)"
+    printf "Choice [1-4]: "
+    read CRON_CHOICE
+    
+    case "$CRON_CHOICE" in
+        1) CRON_RESULT="0 * * * *" ;;
+        2) CRON_RESULT="0 0 * * *" ;;
+        3) CRON_RESULT="0 0 * * 0" ;;
+        4)
+            printf "Enter raw cron interval (e.g., '0 */2 * * *'): "
+            read CRON_RESULT
+            ;;
+        *)
+            echo "❌ Invalid selection. Defaulting to Daily."
+            CRON_RESULT="0 0 * * *"
+            ;;
+    esac
+}
+
 show_menu() {
     clear
     echo "=========================================================================="
     echo "                 Remote SMB Backup Manager      "
     echo "=========================================================================="
+    
+    # Dashboard: Inline listing of all active jobs
+    if [ -z "$(ls -A $CONFIG_DIR 2>/dev/null)" ]; then
+        echo "  (No backup jobs configured)"
+    else
+        for dir in "$CONFIG_DIR"/*; do
+            [ -d "$dir" ] || continue
+            LOCAL_ALIAS=$(basename "$dir")
+            source "$dir/config.sh"
+            LOCAL_CRON_SCHED=$(grep "/remote-backup-worker $LOCAL_ALIAS" "$CRON_FILE" | awk '{print $1,$2,$3,$4,$5}')
+            
+            LOG_FILE="/var/log/remote-backup-${LOCAL_ALIAS}.log"
+            if [ -f "$LOG_FILE" ]; then
+                # Fetch last modified time of the log file using stat
+                LAST_RUN=$(stat -c "%y" "$LOG_FILE" 2>/dev/null | cut -d'.' -f1)
+                # Fetch the last line of the log for a quick status snippet
+                STATUS=$(tail -n 1 "$LOG_FILE" | tr -d '\n' | cut -c 1-60)
+            else
+                LAST_RUN="Never"
+                STATUS="Pending first execution"
+            fi
+            
+            printf "\033[1;36m  ► %s\033[0m\n" "$LOCAL_ALIAS"
+            printf "      Source : %s (User: %s)\n" "$SMB_PATH" "$SMB_USER"
+            printf "      Target : %s\n" "$DESTINATION"
+            printf "      Cron   : %s\n" "$LOCAL_CRON_SCHED"
+            printf "      Status : %s\n" "${STATUS:-No output}"
+            printf "      Updated: %s\n\n" "${LAST_RUN:-Unknown}"
+        done
+    fi
+    
+    echo "=========================================================================="
     echo "   1) Add New Remote Share Backup"
-    echo "   2) List Configured Backups"
-    echo "   3) Run a Backup Manually (Live Verbose Output)"
-    echo "   4) Edit an Existing Backup Job"
-    echo "   5) Delete a Backup Job"
+    echo "   2) Run a Backup Manually (Live Verbose Output)"
+    echo "   3) Edit an Existing Backup Job"
+    echo "   4) Delete a Backup Job"
     echo "   0) Exit"
     echo "=========================================================================="
-    printf "Select an action [0-5]: "
+    printf "Select an action [0-4]: "
 }
 
 # Dynamic Helper: Generates a numbered list of backup jobs for selection
@@ -104,8 +160,8 @@ add_backup() {
     printf "Enter local ZFS destination dataset/path (e.g., /vaultpool/backups): "
     read DESTINATION
     
-    printf "Enter cron interval (e.g., '0 * * * *' for hourly): "
-    read CRON_INT
+    prompt_cron_schedule
+    CRON_INT="$CRON_RESULT"
 
     echo "⚙️  Sealing credentials into TPM..."
     mkdir -p "$CONFIG_DIR/$ALIAS"
@@ -124,35 +180,13 @@ SMB_USER="$SMB_USER"
 DESTINATION="$DESTINATION"
 EOF
 
-    echo "⚙️  Scheduling backup in crontab..."
-    echo "$CRON_INT /usr/local/bin/remote-backup-worker $ALIAS >> /var/log/remote-backup-${ALIAS}.log 2>&1" >> "$CRON_FILE"
+    echo "⚙️  Scheduling backup in crontab (queued via flock)..."
+    echo "$CRON_INT flock /var/lock/remote-backup.lock /usr/local/bin/remote-backup-worker $ALIAS >> /var/log/remote-backup-${ALIAS}.log 2>&1" >> "$CRON_FILE"
     rc-service crond reload >/dev/null 2>&1
     
     echo "✅ Backup job '$ALIAS' successfully provisioned."
     CHANGES_PENDING=1
     sleep 2
-}
-
-list_backups() {
-    echo ""
-    echo "--- Active Backup Jobs ---"
-    if [ -z "$(ls -A $CONFIG_DIR 2>/dev/null)" ]; then
-        echo "  (No backup jobs configured)"
-    else
-        for dir in "$CONFIG_DIR"/*; do
-            [ -d "$dir" ] || continue
-            ALIAS=$(basename "$dir")
-            source "$dir/config.sh"
-            CRON_SCHED=$(grep "/remote-backup-worker $ALIAS" "$CRON_FILE" | awk '{print $1,$2,$3,$4,$5}')
-            
-            printf "\033[1;36m  ► %s\033[0m\n" "$ALIAS"
-            printf "      Source : %s (User: %s)\n" "$SMB_PATH" "$SMB_USER"
-            printf "      Target : %s\n" "$DESTINATION"
-            printf "      Cron   : %s\n\n" "$CRON_SCHED"
-        done
-    fi
-    printf "Press Enter to return..."
-    read DUMMY
 }
 
 run_manual_backup() {
@@ -166,10 +200,11 @@ run_manual_backup() {
     echo ""
     echo "=========================================================================="
     echo " 🚀 Executing live synchronization for: $ALIAS"
+    echo "    (Waiting for queue lock if another backup is running...)"
     echo "=========================================================================="
     
-    # Execute the worker in the foreground with the "verbose" flag
-    /usr/local/bin/remote-backup-worker "$ALIAS" verbose
+    # Execute the worker sequentially using flock to prevent collision with automated tasks
+    flock /var/lock/remote-backup.lock /usr/local/bin/remote-backup-worker "$ALIAS" verbose
     
     echo "=========================================================================="
     printf "\nPress Enter to return to the menu..."
@@ -252,12 +287,11 @@ edit_backup() {
                 sleep 1
                 ;;
             5)
-                printf "Enter new cron interval: "
-                read NEW_VAL
-                if [ -n "$NEW_VAL" ]; then
+                prompt_cron_schedule
+                if [ -n "$CRON_RESULT" ]; then
                     grep -v "/remote-backup-worker $ALIAS" "$CRON_FILE" > "${CRON_FILE}.tmp"
                     mv "${CRON_FILE}.tmp" "$CRON_FILE"
-                    echo "$NEW_VAL /usr/local/bin/remote-backup-worker $ALIAS >> /var/log/remote-backup-${ALIAS}.log 2>&1" >> "$CRON_FILE"
+                    echo "$CRON_RESULT flock /var/lock/remote-backup.lock /usr/local/bin/remote-backup-worker $ALIAS >> /var/log/remote-backup-${ALIAS}.log 2>&1" >> "$CRON_FILE"
                     rc-service crond reload >/dev/null 2>&1
                     CHANGES_PENDING=1
                     echo "✅ Cron interval updated."
@@ -309,10 +343,9 @@ while true; do
 
     case "$OPTION" in
         1) add_backup ;;
-        2) list_backups ;;
-        3) run_manual_backup ;;
-        4) edit_backup ;;
-        5) delete_backup ;;
+        2) run_manual_backup ;;
+        3) edit_backup ;;
+        4) delete_backup ;;
         0) 
             echo ""
             if [ "$CHANGES_PENDING" -eq 1 ]; then

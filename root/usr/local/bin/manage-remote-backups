@@ -30,10 +30,11 @@ show_menu() {
     echo "   1) Add New Remote Share Backup"
     echo "   2) List Configured Backups"
     echo "   3) Run a Backup Manually (Live Verbose Output)"
-    echo "   4) Delete a Backup Job"
+    echo "   4) Edit an Existing Backup Job"
+    echo "   5) Delete a Backup Job"
     echo "   0) Exit"
     echo "=========================================================================="
-    printf "Select an action [0-4]: "
+    printf "Select an action [0-5]: "
 }
 
 # Dynamic Helper: Generates a numbered list of backup jobs for selection
@@ -175,6 +176,105 @@ run_manual_backup() {
     read DUMMY
 }
 
+edit_backup() {
+    echo ""
+    echo "--- Edit Backup Job ---"
+    
+    if ! select_backup; then
+        sleep 2; return
+    fi
+
+    while true; do
+        source "$CONFIG_DIR/$ALIAS/config.sh"
+        CRON_SCHED=$(grep "/remote-backup-worker $ALIAS" "$CRON_FILE" | awk '{print $1,$2,$3,$4,$5}')
+
+        clear
+        echo "=========================================================================="
+        echo " Editing Backup Job: $ALIAS"
+        echo "=========================================================================="
+        echo " 1) SMB Path       [Current: $SMB_PATH]"
+        echo " 2) SMB Username   [Current: $SMB_USER]"
+        echo " 3) SMB Password   [Current: (Sealed in TPM)]"
+        echo " 4) Destination    [Current: $DESTINATION]"
+        echo " 5) Cron Interval  [Current: $CRON_SCHED]"
+        echo " 0) Return to Main Menu"
+        echo "=========================================================================="
+        printf "Select an aspect to edit [0-5]: "
+        read EDIT_OPT
+
+        case "$EDIT_OPT" in
+            1)
+                printf "Enter new SMB Path: "
+                read NEW_VAL
+                if [ -n "$NEW_VAL" ]; then
+                    sed -i "s|^SMB_PATH=.*|SMB_PATH=\"$NEW_VAL\"|" "$CONFIG_DIR/$ALIAS/config.sh"
+                    CHANGES_PENDING=1
+                    echo "✅ SMB Path updated."
+                fi
+                sleep 1
+                ;;
+            2)
+                printf "Enter new SMB Username: "
+                read NEW_VAL
+                if [ -n "$NEW_VAL" ]; then
+                    sed -i "s|^SMB_USER=.*|SMB_USER=\"$NEW_VAL\"|" "$CONFIG_DIR/$ALIAS/config.sh"
+                    CHANGES_PENDING=1
+                    echo "✅ SMB Username updated."
+                fi
+                sleep 1
+                ;;
+            3)
+                stty -echo
+                printf "Enter new SMB Password: "
+                read NEW_VAL
+                stty echo
+                printf "\n"
+                if [ -n "$NEW_VAL" ]; then
+                    echo "⚙️  Resealing new credentials into TPM..."
+                    TMP_PASS=$(mktemp /dev/shm/pass_XXXXXX)
+                    echo -n "$NEW_VAL" > "$TMP_PASS"
+                    tpm2_createprimary -c primary.ctx 2>/dev/null
+                    tpm2_create -C primary.ctx -i "$TMP_PASS" -u "$CONFIG_DIR/$ALIAS/pass.pub" -r "$CONFIG_DIR/$ALIAS/pass.priv"
+                    rm -f "$TMP_PASS" primary.ctx
+                    CHANGES_PENDING=1
+                    echo "✅ SMB Password updated."
+                fi
+                sleep 1
+                ;;
+            4)
+                printf "Enter new local ZFS destination: "
+                read NEW_VAL
+                if [ -n "$NEW_VAL" ]; then
+                    sed -i "s|^DESTINATION=.*|DESTINATION=\"$NEW_VAL\"|" "$CONFIG_DIR/$ALIAS/config.sh"
+                    CHANGES_PENDING=1
+                    echo "✅ Destination updated."
+                fi
+                sleep 1
+                ;;
+            5)
+                printf "Enter new cron interval: "
+                read NEW_VAL
+                if [ -n "$NEW_VAL" ]; then
+                    grep -v "/remote-backup-worker $ALIAS" "$CRON_FILE" > "${CRON_FILE}.tmp"
+                    mv "${CRON_FILE}.tmp" "$CRON_FILE"
+                    echo "$NEW_VAL /usr/local/bin/remote-backup-worker $ALIAS >> /var/log/remote-backup-${ALIAS}.log 2>&1" >> "$CRON_FILE"
+                    rc-service crond reload >/dev/null 2>&1
+                    CHANGES_PENDING=1
+                    echo "✅ Cron interval updated."
+                fi
+                sleep 1
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo "❌ Invalid selection."
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 delete_backup() {
     echo ""
     echo "--- Delete Backup Job ---"
@@ -211,7 +311,8 @@ while true; do
         1) add_backup ;;
         2) list_backups ;;
         3) run_manual_backup ;;
-        4) delete_backup ;;
+        4) edit_backup ;;
+        5) delete_backup ;;
         0) 
             echo ""
             if [ "$CHANGES_PENDING" -eq 1 ]; then

@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+
+def clear_screen():
+    os.system('clear')
+
+def print_header(title):
+    print("\n" + "=" * 50)
+    print(f"{title.center(50)}")
+    print("=" * 50)
+
+def run_cmd(cmd):
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(result.stdout)
+        else:
+            print(f"ERROR:\n{result.stderr}")
+    except Exception as e:
+        print(f"EXCEPTION: {e}")
+
+def menu_status():
+    print_header("SYSTEM STATUS & TELEMETRY")
+    # Use the existing telemetry script
+    run_cmd("/usr/local/bin/generate-telemetry")
+    input("\nPress Enter to return to menu...")
+
+def menu_samba():
+    while True:
+        clear_screen()
+        print_header("SAMBA / SHARE MANAGEMENT")
+        print("1. List Current Shares")
+        print("2. Manage Shares (Interactive)")
+        print("3. Back to Main Menu")
+        
+        choice = input("\nSelect an option: ")
+        if choice == '1':
+            run_cmd("/usr/local/bin/manage-shares --list") # Assuming --list flag exists
+            input("\nPress Enter...")
+        elif choice == '2':
+            run_cmd("/usr/local/bin/manage-shares")
+        elif choice == '3':
+            break
+
+def menu_zfs():
+    while True:
+        clear_screen()
+        print_header("ZFS SNAPSHOT MANAGEMENT")
+        print("1. List Snapshots")
+        print("2. Configure Snapshot Interval/Retention")
+        print("3. Back to Main Menu")
+
+        choice = input("\nSelect an option: ")
+        if choice == '1':
+            run_cmd("zfs list -t snapshot")
+            input("\nPress Enter...")
+        elif choice == '2':
+            print("Feature coming soon (Integrated with Web UI)...")
+            input("\nPress Enter...")
+        elif choice == '3':
+            break
+
+def menu_network():
+    while True:
+        clear_screen()
+        print_header("NETWORK CONFIGURATION")
+        print("1. Show IP/Interface Info")
+        print("2. Change Hostname")
+        print("3. Back to Main Menu")
+
+        choice = input("\nSelect an option: ")
+        if choice == '1':
+            run_cmd("ip addr")
+            run_cmd("hostname -I")
+            input("\nPress Enter...")
+        elif choice == '2':
+            new_name = input("Enter new hostname: ")
+            run_cmd(f"hostname {new_name}")
+            input("\nPress Enter...")
+        elif choice == '3':
+            break
+
+def menu_security():
+    while True:
+        clear_screen()
+        print_header("SECURITY & API MANAGEMENT")
+        print("1. Rotate Commander API Key")
+        print("2. Back to Main Menu")
+
+        choice = input("\nSelect an option: ")
+        if choice == '1':
+            run_cmd("/usr/local/bin/nas-keytool rotate")
+            input("\nPress Enter...")
+        elif choice == '2':
+            break
+
+def main_menu():
+    while True:
+        clear_screen()
+        print_header("NAS STATE CONTROLLER (CLI)")
+        print("1. [Status] System Telemetry")
+        print("2. [Samba] Share Management")
+        print("3. [ZFS] Snapshot Management")
+        print("4. [Network] Network Settings")
+        print("5. [Security] API Key Management")
+        print("Q. Quit")
+
+        choice = input("\nSelect an option: ").upper()
+
+        if choice == '1':
+            menu_status()
+        elif choice == '2':
+            menu_samba()
+        elif choice == '3':
+            menu_zfs()
+        elif choice == '4':
+            menu_network()
+        elif choice == '5':
+            menu_security()
+        elif choice == 'Q':
+            print("Exiting...")
+            break
+        else:
+            print("Invalid selection.")
+
+if __name__ == "__main__":
+    main_menu()

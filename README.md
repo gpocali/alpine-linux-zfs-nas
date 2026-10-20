@@ -10,6 +10,26 @@ This repository provides the root filesystem overlay (`root/`) for a diskless Al
 
 ---
 
+## Installation & Updates (`install.sh` / `nas-update`)
+
+Install or update the system directly from GitHub into a temporary staging directory using a single command:
+
+```sh
+# Interactive Install / Update (prompts to commit LBU and reboot if updates were applied)
+wget -qO- https://raw.githubusercontent.com/gpocali/alpine-linux-zfs-nas/main/install.sh | sh
+
+# Non-Interactive Batch Mode (for scripts or cron; auto-commits LBU and reboots only if updates were applied)
+wget -qO- https://raw.githubusercontent.com/gpocali/alpine-linux-zfs-nas/main/install.sh | sh -s -- --batch
+```
+
+Once installed, the updater is also available locally at `/usr/local/bin/nas-update` (`nas-update` or `nas-update --batch`).
+
+* **Safe Update Mode:** Automatically detects existing installations (`/etc/alpine-zfs-nas.installed` or installed scripts) and skips overwriting live configuration files (`/etc/samba/smb.conf`, `/etc/samba/shares.list`, `/etc/lbu/lbu.conf`, etc.).
+* **Multi-Process Config Merging:** Non-destructively merges missing entries into shared system files (`/etc/modules`, `/etc/apk/repositories`, and `/etc/crontabs/root`) without overwriting modules, mirrors, or cron jobs added by other processes.
+* **Automatic LBU Registration:** Registers all managed files outside `/etc` (`/usr/local/bin/*`, `/var/www/dashboard/*`) with `lbu include`.
+
+---
+
 ## Interactive Dashboards & CLI Utilities
 
 ### 1. Unified NAS State Controller (`nas-ctl`)

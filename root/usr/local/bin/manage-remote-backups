@@ -60,8 +60,11 @@ show_menu() {
         for dir in "$CONFIG_DIR"/*; do
             [ -d "$dir" ] || continue
             LOCAL_ALIAS=$(basename "$dir")
-            source "$dir/config.sh"
-            LOCAL_CRON_SCHED=$(grep "/remote-backup-worker $LOCAL_ALIAS" "$CRON_FILE" | awk '{print $1,$2,$3,$4,$5}')
+            SMB_PATH=""
+            SMB_USER=""
+            DESTINATION=""
+            [ -f "$dir/config.sh" ] && source "$dir/config.sh"
+            LOCAL_CRON_SCHED=$(grep "/remote-backup-worker $LOCAL_ALIAS" "$CRON_FILE" 2>/dev/null | awk '{print $1,$2,$3,$4,$5}')
             
             LOG_FILE="/var/log/remote-backup-${LOCAL_ALIAS}.log"
             if [ -f "$LOG_FILE" ]; then
@@ -166,13 +169,15 @@ add_backup() {
     echo "⚙️  Sealing credentials into TPM..."
     mkdir -p "$CONFIG_DIR/$ALIAS"
     
-    TMP_PASS=$(mktemp /dev/shm/pass_XXXXXX)
+    TMP_DIR=$(mktemp -d /dev/shm/tpm_seal_XXXXXX)
+    TMP_PASS="$TMP_DIR/pass"
+    PRIMARY_CTX="$TMP_DIR/primary.ctx"
     echo -n "$SMB_PASS" > "$TMP_PASS"
     
-    tpm2_createprimary -c primary.ctx 2>/dev/null
-    tpm2_create -C primary.ctx -i "$TMP_PASS" -u "$CONFIG_DIR/$ALIAS/pass.pub" -r "$CONFIG_DIR/$ALIAS/pass.priv"
+    tpm2_createprimary -c "$PRIMARY_CTX" >/dev/null 2>&1
+    tpm2_create -C "$PRIMARY_CTX" -i "$TMP_PASS" -u "$CONFIG_DIR/$ALIAS/pass.pub" -r "$CONFIG_DIR/$ALIAS/pass.priv" >/dev/null 2>&1
     
-    rm -f "$TMP_PASS" primary.ctx
+    rm -rf "$TMP_DIR"
     
     cat <<EOF > "$CONFIG_DIR/$ALIAS/config.sh"
 SMB_PATH="$SMB_PATH"
@@ -266,11 +271,13 @@ edit_backup() {
                 printf "\n"
                 if [ -n "$NEW_VAL" ]; then
                     echo "⚙️  Resealing new credentials into TPM..."
-                    TMP_PASS=$(mktemp /dev/shm/pass_XXXXXX)
+                    TMP_DIR=$(mktemp -d /dev/shm/tpm_seal_XXXXXX)
+                    TMP_PASS="$TMP_DIR/pass"
+                    PRIMARY_CTX="$TMP_DIR/primary.ctx"
                     echo -n "$NEW_VAL" > "$TMP_PASS"
-                    tpm2_createprimary -c primary.ctx 2>/dev/null
-                    tpm2_create -C primary.ctx -i "$TMP_PASS" -u "$CONFIG_DIR/$ALIAS/pass.pub" -r "$CONFIG_DIR/$ALIAS/pass.priv"
-                    rm -f "$TMP_PASS" primary.ctx
+                    tpm2_createprimary -c "$PRIMARY_CTX" >/dev/null 2>&1
+                    tpm2_create -C "$PRIMARY_CTX" -i "$TMP_PASS" -u "$CONFIG_DIR/$ALIAS/pass.pub" -r "$CONFIG_DIR/$ALIAS/pass.priv" >/dev/null 2>&1
+                    rm -rf "$TMP_DIR"
                     CHANGES_PENDING=1
                     echo "✅ SMB Password updated."
                 fi

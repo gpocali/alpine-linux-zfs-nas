@@ -38,7 +38,17 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 fi
 
 echo $$ > "$LOCK_DIR/pid"
-trap 'rm -rf "$LOCK_DIR"; exit' INT TERM EXIT
+MOUNT_POINT="/remote/$ALIAS"
+TMPFS_DIR=""
+
+cleanup() {
+    [ -n "$TMPFS_DIR" ] && [ -d "$TMPFS_DIR" ] && rm -rf "$TMPFS_DIR"
+    if [ -n "$MOUNT_POINT" ] && mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+        umount "$MOUNT_POINT" 2>/dev/null || umount -l "$MOUNT_POINT" 2>/dev/null
+    fi
+    rm -rf "$LOCK_DIR"
+}
+trap 'cleanup; exit' INT TERM EXIT
 # ==========================================
 
 CONFIG_DIR="/etc/remote-backups/$ALIAS"
@@ -48,7 +58,6 @@ if [ ! -f "$CONFIG_DIR/config.sh" ]; then
 fi
 
 source "$CONFIG_DIR/config.sh"
-MOUNT_POINT="/remote/$ALIAS"
 
 mkdir -p "$MOUNT_POINT"
 
@@ -64,24 +73,30 @@ fi
 # Build credentials in a secure temporary RAM disk
 TMPFS_DIR=$(mktemp -d /dev/shm/smb_cred_XXXXXX)
 CRED_FILE="$TMPFS_DIR/credentials"
+PRIMARY_CTX="$TMPFS_DIR/primary.ctx"
+KEY_CTX="$TMPFS_DIR/key.ctx"
 
 echo "username=$SMB_USER" > "$CRED_FILE"
 printf "password=" >> "$CRED_FILE"
 
 # Unseal password from TPM
-tpm2_createprimary -c primary.ctx 2>/dev/null
-tpm2_load -C primary.ctx -u "$CONFIG_DIR/pass.pub" -r "$CONFIG_DIR/pass.priv" -c key.ctx
-tpm2_unseal -c key.ctx >> "$CRED_FILE"
+if ! tpm2_createprimary -c "$PRIMARY_CTX" >/dev/null 2>&1 || \
+   ! tpm2_load -C "$PRIMARY_CTX" -u "$CONFIG_DIR/pass.pub" -r "$CONFIG_DIR/pass.priv" -c "$KEY_CTX" >/dev/null 2>&1 || \
+   ! tpm2_unseal -c "$KEY_CTX" >> "$CRED_FILE" 2>/dev/null; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - ❌ Failed to unseal TPM credentials for $ALIAS"
+    rm -rf "$TMPFS_DIR"
+    exit 1
+fi
 
 # Mount the remote share read-only
 if ! mount -t cifs "$SMB_PATH" "$MOUNT_POINT" -o credentials="$CRED_FILE",ro; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') - ❌ Failed to mount $SMB_PATH"
-    rm -rf "$TMPFS_DIR" primary.ctx key.ctx
+    rm -rf "$TMPFS_DIR"
     exit 1
 fi
 
 # Immediately scrub plaintext credentials and context files
-rm -rf "$TMPFS_DIR" primary.ctx key.ctx
+rm -rf "$TMPFS_DIR"
 
 # Direct flat routing
 TARGET_PATH="$DESTINATION/$ALIAS"
@@ -94,19 +109,27 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') - ⚙️  Starting incremental rsync mirror f
 # If executed manually from the dashboard, show raw output.
 # Otherwise (cron job), pipe to tr to strip carriage returns to prevent log inflation.
 if [ "$MODE" = "verbose" ]; then
-    RSYNC_CMD="rsync -gloptruv --progress --exclude 'System Volume Information' --exclude '\$RECYCLE.BIN' --delete --delete-excluded \"$MOUNT_POINT/\" \"$TARGET_PATH/\""
-    eval "$RSYNC_CMD"
+    rsync -gloptruv --progress \
+        --exclude 'System Volume Information' \
+        --exclude '$RECYCLE.BIN' \
+        --delete --delete-excluded \
+        "$MOUNT_POINT/" "$TARGET_PATH/"
+    RSYNC_STATUS=$?
 else
-    RSYNC_CMD="rsync -gloptruv --progress --exclude 'System Volume Information' --exclude '\$RECYCLE.BIN' --delete --delete-excluded \"$MOUNT_POINT/\" \"$TARGET_PATH/\" | tr -d '\r'"
-    eval "$RSYNC_CMD"
+    rsync -gloptruv --progress \
+        --exclude 'System Volume Information' \
+        --exclude '$RECYCLE.BIN' \
+        --delete --delete-excluded \
+        "$MOUNT_POINT/" "$TARGET_PATH/" | tr -d '\r'
+    RSYNC_STATUS=$?
 fi
 
 # Record exit status
-if [ $? -eq 0 ]; then
+if [ "$RSYNC_STATUS" -eq 0 ]; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') - ✅ Backup complete."
     date '+%Y-%m-%d %H:%M:%S' > "$CONFIG_DIR/last_success"
 else
     echo "$(date '+%Y-%m-%d %H:%M:%S') - ❌ Backup encountered errors."
 fi
 
-umount "$MOUNT_POINT"
+umount "$MOUNT_POINT" 2>/dev/null || umount -l "$MOUNT_POINT" 2>/dev/null

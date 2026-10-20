@@ -1,66 +1,110 @@
 #!/usr/bin/env python3
 import os
+import re
 import sys
 import subprocess
 
+
 def clear_screen():
-    os.system('clear')
+    os.system("clear")
+
 
 def print_header(title):
     print("\n" + "=" * 50)
     print(f"{title.center(50)}")
     print("=" * 50)
 
+
 def run_cmd(cmd):
     try:
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         if result.returncode == 0:
-            print(result.stdout)
+            if result.stdout:
+                print(result.stdout)
         else:
-            print(f"ERROR:\n{result.stderr}")
+            print(f"ERROR:\n{result.stderr or result.stdout}")
     except Exception as e:
         print(f"EXCEPTION: {e}")
 
+
+def run_interactive(cmd):
+    try:
+        subprocess.run(cmd, shell=True)
+    except Exception as e:
+        print(f"EXCEPTION: {e}")
+
+
 def menu_status():
+    clear_screen()
     print_header("SYSTEM STATUS & TELEMETRY")
-    # Use the existing telemetry script
+    # Refresh the Web UI telemetry JSON
     run_cmd("/usr/local/bin/generate-telemetry")
+    print("--- ZFS Pools ---")
+    run_cmd("zpool list")
+    print("--- ZFS Datasets ---")
+    run_cmd("zfs list")
+    print("--- Array Drive States ---")
+    run_cmd("/usr/local/bin/array-control status")
     input("\nPress Enter to return to menu...")
+
 
 def menu_samba():
     while True:
         clear_screen()
         print_header("SAMBA / SHARE MANAGEMENT")
         print("1. List Current Shares")
-        print("2. Manage Shares (Interactive)")
-        print("3. Back to Main Menu")
-        
-        choice = input("\nSelect an option: ")
-        if choice == '1':
-            run_cmd("/usr/local/bin/manage-shares --list") # Assuming --list flag exists
+        print("2. Manage Shares & Datasets (Interactive)")
+        print("3. Manage Samba Users (Interactive)")
+        print("4. Manage Remote SMB Backups (Interactive)")
+        print("5. Back to Main Menu")
+
+        choice = input("\nSelect an option: ").strip()
+        if choice == "1":
+            run_cmd("/usr/local/bin/manage-shares --list")
             input("\nPress Enter...")
-        elif choice == '2':
-            run_cmd("/usr/local/bin/manage-shares")
-        elif choice == '3':
+        elif choice == "2":
+            run_interactive("/usr/local/bin/manage-shares")
+        elif choice == "3":
+            run_interactive("/usr/local/bin/manage-share-users")
+        elif choice == "4":
+            run_interactive("/usr/local/bin/manage-remote-backups")
+        elif choice == "5":
             break
+
 
 def menu_zfs():
     while True:
         clear_screen()
-        print_header("ZFS SNAPSHOT MANAGEMENT")
+        print_header("ZFS SNAPSHOT & STORAGE MANAGEMENT")
         print("1. List Snapshots")
-        print("2. Configure Snapshot Interval/Retention")
-        print("3. Back to Main Menu")
+        print("2. Take Instant Manual Snapshot")
+        print("3. Run ZFS Autokeeper (Snapshot & Prune)")
+        print("4. Run NVMe Cache Mover (Flush to Vault)")
+        print("5. Configure Snapshot Schedule (Interactive)")
+        print("6. Back to Main Menu")
 
-        choice = input("\nSelect an option: ")
-        if choice == '1':
+        choice = input("\nSelect an option: ").strip()
+        if choice == "1":
             run_cmd("zfs list -t snapshot")
             input("\nPress Enter...")
-        elif choice == '2':
-            print("Feature coming soon (Integrated with Web UI)...")
+        elif choice == "2":
+            ds = input("Enter dataset name (e.g., media): ").strip()
+            if ds and re.match(r"^[a-zA-Z0-9_-]+$", ds):
+                subprocess.run(["/usr/local/bin/manage-shares", "--snapshot", ds])
+            else:
+                print("Invalid dataset name.")
             input("\nPress Enter...")
-        elif choice == '3':
+        elif choice == "3":
+            run_cmd("/usr/local/bin/zfs-autokeeper")
+            input("\nPress Enter...")
+        elif choice == "4":
+            run_interactive("/usr/local/bin/cache-mover.sh force -v")
+            input("\nPress Enter...")
+        elif choice == "5":
+            run_interactive("/usr/local/bin/manage-shares")
+        elif choice == "6":
             break
+
 
 def menu_network():
     while True:
@@ -70,17 +114,27 @@ def menu_network():
         print("2. Change Hostname")
         print("3. Back to Main Menu")
 
-        choice = input("\nSelect an option: ")
-        if choice == '1':
+        choice = input("\nSelect an option: ").strip()
+        if choice == "1":
             run_cmd("ip addr")
-            run_cmd("hostname -I")
+            run_cmd("hostname -i 2>/dev/null || hostname")
             input("\nPress Enter...")
-        elif choice == '2':
-            new_name = input("Enter new hostname: ")
-            run_cmd(f"hostname {new_name}")
+        elif choice == "2":
+            new_name = input("Enter new hostname: ").strip()
+            if new_name and re.match(r"^[a-zA-Z0-9][a-zA-Z0-9.-]*$", new_name):
+                try:
+                    subprocess.run(["hostname", new_name], check=True)
+                    with open("/etc/hostname", "w") as f:
+                        f.write(f"{new_name}\n")
+                    print(f"Hostname updated to '{new_name}'. Remember to run 'lbu commit -d' to persist.")
+                except Exception as e:
+                    print(f"ERROR: Failed to update hostname: {e}")
+            else:
+                print("ERROR: Invalid hostname format.")
             input("\nPress Enter...")
-        elif choice == '3':
+        elif choice == "3":
             break
+
 
 def menu_security():
     while True:
@@ -89,41 +143,43 @@ def menu_security():
         print("1. Rotate Commander API Key")
         print("2. Back to Main Menu")
 
-        choice = input("\nSelect an option: ")
-        if choice == '1':
+        choice = input("\nSelect an option: ").strip()
+        if choice == "1":
             run_cmd("/usr/local/bin/nas-keytool rotate")
             input("\nPress Enter...")
-        elif choice == '2':
+        elif choice == "2":
             break
+
 
 def main_menu():
     while True:
         clear_screen()
         print_header("NAS STATE CONTROLLER (CLI)")
-        print("1. [Status] System Telemetry")
-        print("2. [Samba] Share Management")
-        print("3. [ZFS] Snapshot Management")
-        print("4. [Network] Network Settings")
+        print("1. [Status]   System Telemetry & Drive States")
+        print("2. [Samba]    Share, User & Backup Management")
+        print("3. [ZFS]      Snapshot & Cache Tier Management")
+        print("4. [Network]  Network Settings")
         print("5. [Security] API Key Management")
         print("Q. Quit")
 
-        choice = input("\nSelect an option: ").upper()
+        choice = input("\nSelect an option: ").strip().upper()
 
-        if choice == '1':
+        if choice == "1":
             menu_status()
-        elif choice == '2':
+        elif choice == "2":
             menu_samba()
-        elif choice == '3':
+        elif choice == "3":
             menu_zfs()
-        elif choice == '4':
+        elif choice == "4":
             menu_network()
-        elif choice == '5':
+        elif choice == "5":
             menu_security()
-        elif choice == 'Q':
+        elif choice == "Q":
             print("Exiting...")
             break
         else:
             print("Invalid selection.")
+
 
 if __name__ == "__main__":
     main_menu()

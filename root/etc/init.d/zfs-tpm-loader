@@ -11,14 +11,18 @@ depend() {
 start() {
     ebegin "Unsealing ZFS key from Asus TPM"
     
+    KEY_FILE="/dev/shm/unsealed.key"
+    umask 077
+    
     # Decrypt the sealed payload into volatile RAM
-    if clevis decrypt < /etc/zfs/tpm-sealed.jwe > /tmp/unsealed.key 2>/dev/null; then
-        # Load the key into vaultpool
-        zfs load-key vaultpool < /tmp/unsealed.key
-		zfs load-key fastpool < /tmp/unsealed.key
-        rm -f /tmp/unsealed.key
+    if clevis decrypt < /etc/zfs/tpm-sealed.jwe > "$KEY_FILE" 2>/dev/null; then
+        # Load the key into vaultpool and fastpool (if present)
+        zfs list -H -o name vaultpool >/dev/null 2>&1 && zfs load-key vaultpool < "$KEY_FILE"
+        zfs list -H -o name fastpool >/dev/null 2>&1 && zfs load-key fastpool < "$KEY_FILE"
+        rm -f "$KEY_FILE"
         eend 0
     else
+        rm -f "$KEY_FILE"
         eend 1 "Failed to unseal key from TPM!"
     fi
 }

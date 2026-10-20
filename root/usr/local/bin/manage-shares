@@ -5,7 +5,12 @@ SMB_CONF="/etc/samba/smb.conf"
 TMP_CONF="/tmp/smb.conf.tmp"
 
 CHANGES_PENDING=0
+mkdir -p "$(dirname "$SHARE_LIST")"
 touch "$SHARE_LIST"
+
+# Ensure required storage access groups exist
+getent group storage-rw >/dev/null 2>&1 || addgroup storage-rw >/dev/null 2>&1
+getent group storage-ro >/dev/null 2>&1 || addgroup storage-ro >/dev/null 2>&1
 
 # ==========================================
 # Self-Healing Dependency Checks
@@ -108,7 +113,10 @@ create_dataset() {
     read D_NAME
     
     if ! echo "$D_NAME" | grep -Eq '^[a-zA-Z0-9_-]+$'; then echo "❌ Error: Invalid name."; return; fi
-    if zfs list -H -o name vaultpool/$D_NAME >/dev/null 2>&1; then echo "❌ Error: Dataset already exists."; return; fi
+    if zfs list -H -o name "vaultpool/$D_NAME" >/dev/null 2>&1 || zfs list -H -o name "fastpool/$D_NAME" >/dev/null 2>&1; then
+        echo "❌ Error: Dataset already exists."
+        return
+    fi
 
     echo ""
     echo "Select Storage Tier:"
@@ -263,14 +271,15 @@ manage_dataset_menu() {
         SNAP_V=$(zfs get -H -o value custom:autosnap vaultpool/$D_NAME 2>/dev/null)
         SNAP_F=$(zfs get -H -o value custom:autosnap fastpool/$D_NAME 2>/dev/null)
         RET_V=$(zfs get -H -o value custom:keep_days vaultpool/$D_NAME 2>/dev/null)
+        RET_F=$(zfs get -H -o value custom:keep_days fastpool/$D_NAME 2>/dev/null)
         
         SNAP_DISP="Disabled"
         if [ "$SNAP_V" = "daily" ] && [ "$SNAP_F" = "daily" ]; then SNAP_DISP="Both Pools (Daily, Keep ${RET_V}d)"
         elif [ "$SNAP_V" = "daily" ]; then SNAP_DISP="vaultpool Only (Daily, Keep ${RET_V}d)"
-        elif [ "$SNAP_F" = "daily" ]; then SNAP_DISP="fastpool Only (Daily)"
+        elif [ "$SNAP_F" = "daily" ]; then SNAP_DISP="fastpool Only (Daily, Keep ${RET_F}d)"
         fi
 
-        CURRENT_VIS=$(zfs get -H -o value snapdir vaultpool/$D_NAME 2>/dev/null)
+        CURRENT_VIS=$(zfs get -H -o value snapdir vaultpool/$D_NAME 2>/dev/null || zfs get -H -o value snapdir fastpool/$D_NAME 2>/dev/null)
         if [ "$CURRENT_VIS" = "visible" ]; then VIS_DISP="Visible (.zfs and @Snapshots active)"; else VIS_DISP="Hidden"; fi
 
         echo "================================================="
@@ -398,14 +407,26 @@ manage_dataset_menu() {
                 printf "Choice: "
                 read INTERVAL
 
-                [ "$P_CHOICE" = "1" ] || [ "$P_CHOICE" = "3" ] && zfs inherit custom:autosnap vaultpool/$D_NAME 2>/dev/null && zfs inherit custom:keep_days vaultpool/$D_NAME 2>/dev/null
-                [ "$P_CHOICE" = "2" ] || [ "$P_CHOICE" = "3" ] && zfs inherit custom:autosnap fastpool/$D_NAME 2>/dev/null && zfs inherit custom:keep_days fastpool/$D_NAME 2>/dev/null
+                if [ "$P_CHOICE" = "1" ] || [ "$P_CHOICE" = "3" ]; then
+                    zfs inherit custom:autosnap vaultpool/$D_NAME 2>/dev/null
+                    zfs inherit custom:keep_days vaultpool/$D_NAME 2>/dev/null
+                fi
+                if [ "$P_CHOICE" = "2" ] || [ "$P_CHOICE" = "3" ]; then
+                    zfs inherit custom:autosnap fastpool/$D_NAME 2>/dev/null
+                    zfs inherit custom:keep_days fastpool/$D_NAME 2>/dev/null
+                fi
 
                 if [ "$INTERVAL" = "1" ]; then
                     printf "Keep snapshots for how many days? (e.g., 14, 30): "
                     read K_DAYS
-                    [ "$P_CHOICE" = "1" ] || [ "$P_CHOICE" = "3" ] && zfs set custom:autosnap=daily vaultpool/$D_NAME && zfs set custom:keep_days=$K_DAYS vaultpool/$D_NAME
-                    [ "$P_CHOICE" = "2" ] || [ "$P_CHOICE" = "3" ] && zfs set custom:autosnap=daily fastpool/$D_NAME && zfs set custom:keep_days=$K_DAYS fastpool/$D_NAME
+                    if [ "$P_CHOICE" = "1" ] || [ "$P_CHOICE" = "3" ]; then
+                        zfs set custom:autosnap=daily vaultpool/$D_NAME 2>/dev/null
+                        zfs set custom:keep_days=$K_DAYS vaultpool/$D_NAME 2>/dev/null
+                    fi
+                    if [ "$P_CHOICE" = "2" ] || [ "$P_CHOICE" = "3" ]; then
+                        zfs set custom:autosnap=daily fastpool/$D_NAME 2>/dev/null
+                        zfs set custom:keep_days=$K_DAYS fastpool/$D_NAME 2>/dev/null
+                    fi
                 fi
                 continue
 
@@ -501,6 +522,116 @@ manage_dataset_menu() {
 }
 
 # ==========================================
+# Non-Interactive CLI Operations
+# ==========================================
+print_datasets_list() {
+    DS_LIST=$(zfs list -H -o name -t filesystem 2>/dev/null | grep '/' | cut -d'/' -f2 | sort | uniq)
+    if [ -z "$DS_LIST" ]; then
+        echo "   (No datasets found)"
+        return 1
+    fi
+
+    set -- $DS_LIST
+    i=1
+    for DIR_NAME in "$@"; do
+        RESOLVED=$(resolve_target_dir "$DIR_NAME")
+        TARGET_DIR=$(echo "$RESOLVED" | cut -d'|' -f1)
+        MNT_TYPE=$(echo "$RESOLVED" | cut -d'|' -f2)
+
+        MATCH=$(grep "|$TARGET_DIR|" "$SHARE_LIST" 2>/dev/null)
+        if [ -n "$MATCH" ]; then
+            PERM=$(echo "$MATCH" | cut -d'|' -f3)
+            MASK=$(echo "$MATCH" | cut -d'|' -f4)
+            if [ "$MASK" = "root" ]; then
+                SMB_STATE="Shared [$PERM] (Root Masked)"
+            else
+                SMB_STATE="Shared [$PERM]"
+            fi
+        else
+            SMB_STATE="Offline"
+        fi
+
+        QUOTA=$(zfs get -H -o value quota vaultpool/$DIR_NAME 2>/dev/null || zfs get -H -o value quota fastpool/$DIR_NAME 2>/dev/null)
+        [ "$QUOTA" = "none" ] || [ -z "$QUOTA" ] && Q_DISP="" || Q_DISP="[Max: $QUOTA]"
+
+        SNAP_V=$(zfs get -H -o value custom:autosnap vaultpool/$DIR_NAME 2>/dev/null)
+        SNAP_F=$(zfs get -H -o value custom:autosnap fastpool/$DIR_NAME 2>/dev/null)
+        S_DISP=""
+        if [ "$SNAP_V" = "daily" ] && [ "$SNAP_F" = "daily" ]; then S_DISP="[Snap: Both]"
+        elif [ "$SNAP_V" = "daily" ]; then S_DISP="[Snap: HDD]"
+        elif [ "$SNAP_F" = "daily" ]; then S_DISP="[Snap: NVMe]"; fi
+
+        printf "  %2d) %-18s %-12s %-15s -> %s\n" "$i" "$DIR_NAME" "$Q_DISP" "$S_DISP" "$SMB_STATE"
+        printf "      └─ %-12s : %s\n\n" "$MNT_TYPE" "$TARGET_DIR"
+        i=$((i + 1))
+    done
+    return 0
+}
+
+if [ $# -gt 0 ]; then
+    case "$1" in
+        --list|list)
+            echo "=========================================================================="
+            echo "   Logical ZFS Datasets & Network Shares"
+            echo "=========================================================================="
+            print_datasets_list || true
+            exit 0
+            ;;
+        --snapshot|snapshot)
+            TARGET_DS="$2"
+            SNAP_LABEL="${3:-manual-$(date +%Y-%m-%d_%H%M)}"
+            if [ -z "$TARGET_DS" ]; then
+                echo "Usage: manage-shares --snapshot <dataset> [snapshot_name]"
+                exit 1
+            fi
+            CREATED=0
+            if zfs list -H -o name "vaultpool/$TARGET_DS" >/dev/null 2>&1; then
+                zfs snapshot "vaultpool/$TARGET_DS@$SNAP_LABEL" && CREATED=1
+            fi
+            if zfs list -H -o name "fastpool/$TARGET_DS" >/dev/null 2>&1; then
+                zfs snapshot "fastpool/$TARGET_DS@$SNAP_LABEL" && CREATED=1
+            fi
+            if [ "$CREATED" -eq 1 ]; then
+                echo "✅ Created snapshot @$SNAP_LABEL for $TARGET_DS"
+                exit 0
+            else
+                echo "❌ Error: Dataset '$TARGET_DS' not found on vaultpool or fastpool."
+                exit 1
+            fi
+            ;;
+        --delete-dataset|delete-dataset)
+            TARGET_DS="$2"
+            if [ -z "$TARGET_DS" ]; then
+                echo "Usage: manage-shares --delete-dataset <dataset>"
+                exit 1
+            fi
+            if ! zfs list -H -o name "vaultpool/$TARGET_DS" >/dev/null 2>&1 && ! zfs list -H -o name "fastpool/$TARGET_DS" >/dev/null 2>&1; then
+                echo "❌ Error: Dataset '$TARGET_DS' not found."
+                exit 1
+            fi
+            RESOLVED=$(resolve_target_dir "$TARGET_DS")
+            TARGET_DIR=$(echo "$RESOLVED" | cut -d'|' -f1)
+            ITEMS=$(ls -A "$TARGET_DIR" 2>/dev/null | wc -l)
+            if [ "$ITEMS" -gt 0 ]; then
+                echo "❌ Error: Dataset '$TARGET_DS' is NOT empty ($ITEMS items found)!"
+                exit 1
+            fi
+            zfs destroy -r "vaultpool/$TARGET_DS" >/dev/null 2>&1 && echo "✅ Destroyed vaultpool/$TARGET_DS"
+            zfs destroy -r "fastpool/$TARGET_DS" >/dev/null 2>&1 && echo "✅ Destroyed fastpool/$TARGET_DS"
+            rmdir "$TARGET_DIR" >/dev/null 2>&1
+            grep -v "|$TARGET_DIR|" "$SHARE_LIST" > "${SHARE_LIST}.tmp"
+            mv "${SHARE_LIST}.tmp" "$SHARE_LIST"
+            compile_and_reload
+            exit 0
+            ;;
+        *)
+            echo "Usage: manage-shares [--list | --snapshot <dataset> [name] | --delete-dataset <dataset>]"
+            exit 1
+            ;;
+    esac
+fi
+
+# ==========================================
 # Core Operational Loop & Dashboard
 # ==========================================
 
@@ -511,46 +642,14 @@ while true; do
     echo "=========================================================================="
     echo "   Logical ZFS Datasets:"
 
-    DS_LIST=$(zfs list -H -o name -t filesystem | grep '/' | cut -d'/' -f2 | sort | uniq)
+    DS_LIST=$(zfs list -H -o name -t filesystem 2>/dev/null | grep '/' | cut -d'/' -f2 | sort | uniq)
     
     if [ -z "$DS_LIST" ]; then
         echo "   (No datasets found)"
         set -- 
     else
         set -- $DS_LIST
-        i=1
-        for DIR_NAME in "$@"; do
-            RESOLVED=$(resolve_target_dir "$DIR_NAME")
-            TARGET_DIR=$(echo "$RESOLVED" | cut -d'|' -f1)
-            MNT_TYPE=$(echo "$RESOLVED" | cut -d'|' -f2)
-
-            MATCH=$(grep "|$TARGET_DIR|" "$SHARE_LIST")
-            if [ -n "$MATCH" ]; then 
-                PERM=$(echo "$MATCH" | cut -d'|' -f3)
-                MASK=$(echo "$MATCH" | cut -d'|' -f4)
-                if [ "$MASK" = "root" ]; then
-                    SMB_STATE="Shared [$PERM] (Root Masked)"
-                else
-                    SMB_STATE="Shared [$PERM]"
-                fi
-            else 
-                SMB_STATE="Offline"
-            fi
-            
-            QUOTA=$(zfs get -H -o value quota vaultpool/$DIR_NAME 2>/dev/null)
-            [ "$QUOTA" = "none" ] || [ -z "$QUOTA" ] && Q_DISP="" || Q_DISP="[Max: $QUOTA]"
-            
-            SNAP_V=$(zfs get -H -o value custom:autosnap vaultpool/$DIR_NAME 2>/dev/null)
-            SNAP_F=$(zfs get -H -o value custom:autosnap fastpool/$DIR_NAME 2>/dev/null)
-            S_DISP=""
-            if [ "$SNAP_V" = "daily" ] && [ "$SNAP_F" = "daily" ]; then S_DISP="[Snap: Both]"
-            elif [ "$SNAP_V" = "daily" ]; then S_DISP="[Snap: HDD]"
-            elif [ "$SNAP_F" = "daily" ]; then S_DISP="[Snap: NVMe]"; fi
-
-            printf "  %2d) %-18s %-12s %-15s -> %s\n" "$i" "$DIR_NAME" "$Q_DISP" "$S_DISP" "$SMB_STATE"
-            printf "      └─ %-12s : %s\n\n" "$MNT_TYPE" "$TARGET_DIR"
-            i=$((i + 1))
-        done
+        print_datasets_list
     fi
     echo "--------------------------------------------------------------------------"
     echo "   N) Create New Dataset  "

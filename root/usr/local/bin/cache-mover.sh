@@ -17,6 +17,9 @@ OVERRIDE_FILE="/etc/zfs_tier_overrides.conf"
 # --- Argument Parsing ---
 for arg in "$@"; do
     case $arg in
+        check)
+            MODE="auto"
+            ;;
         force)
             MODE="force"
             ;;

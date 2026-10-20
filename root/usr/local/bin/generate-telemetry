@@ -26,13 +26,12 @@ EOF
     
     FIRST_DISK=1
     # Extract the physical drive names from zpool status
-    for disk in $(zpool status "$name" | awk '/ata-+|nvme[0-9]+/{print $1}'); do
+    for disk in $(zpool status "$name" 2>/dev/null | awk '/ata-|nvme/{print $1}'); do
         disk_clean=$(basename "$disk")
-        # Strip partition numbers so hdparm targets the raw drive enclosure (e.g., sda1 -> sda)
-        # base_disk=$(echo "$disk_clean" | sed -E 's/[0-9]+$//')
-        base_disk="$disk_clean"
+        # Strip partition suffixes so hdparm targets the raw drive enclosure
+        base_disk=$(echo "$disk_clean" | sed 's/-part[0-9]*$//')
         
-        if [[ "$base_disk" != "errors:" ]]; then
+        if [ "$base_disk" != "errors:" ]; then
             # Check sleep state (safely ignores NVMe drives returning errors)
             if hdparm -C "/dev/disk/by-id/$base_disk" 2>/dev/null | grep -qi "standby"; then
                 D_STATE="Standby"
@@ -64,8 +63,8 @@ zfs list -H -o name,used,available,quota,compressratio -t filesystem | while rea
     DS_BASE=$(basename "$name")
     MNT_PATH="/mnt/$DS_BASE"
     
-    # Check if this dataset exists in our active Samba share list
-    SHARE_MATCH=$(grep "|$MNT_PATH|" "$SHARE_LIST" 2>/dev/null)
+    # Check if this dataset exists in our active Samba share list (by dataset name or mount path)
+    SHARE_MATCH=$(grep "^${DS_BASE}|" "$SHARE_LIST" 2>/dev/null || grep "|$MNT_PATH|" "$SHARE_LIST" 2>/dev/null)
     if [ -n "$SHARE_MATCH" ]; then
         SMB_STATE="Active"
         SMB_PERM=$(echo "$SHARE_MATCH" | cut -d'|' -f3)
@@ -106,8 +105,10 @@ if [ -d "/etc/remote-backups" ]; then
     for dir in /etc/remote-backups/*; do
         [ -d "$dir" ] || continue
         ALIAS=$(basename "$dir")
+        SMB_PATH=""
+        DESTINATION=""
         
-        source "$dir/config.sh" 2>/dev/null
+        [ -f "$dir/config.sh" ] && source "$dir/config.sh" 2>/dev/null
         
         if ps | grep -v grep | grep -q "remote-backup-worker $ALIAS"; then
             STATE="Running"

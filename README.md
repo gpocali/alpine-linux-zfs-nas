@@ -53,6 +53,7 @@ manage-shares
 # Non-interactive CLI commands
 manage-shares --list
 manage-shares --snapshot <dataset> [snapshot_name]
+manage-shares --schedule [dataset]
 manage-shares --delete-dataset <dataset>
 ```
 **Capabilities:**

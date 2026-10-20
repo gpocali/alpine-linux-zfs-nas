@@ -243,6 +243,141 @@ delete_dataset() {
     return 0
 }
 
+configure_dataset_schedule() {
+    D_NAME="$1"
+    HAS_V=0
+    HAS_F=0
+    zfs list -H -o name "vaultpool/$D_NAME" >/dev/null 2>&1 && HAS_V=1
+    zfs list -H -o name "fastpool/$D_NAME" >/dev/null 2>&1 && HAS_F=1
+
+    if [ "$HAS_V" -eq 0 ] && [ "$HAS_F" -eq 0 ]; then
+        echo "❌ Error: Dataset '$D_NAME' not found."
+        sleep 2
+        return 1
+    fi
+
+    echo ""
+    if [ "$HAS_V" -eq 1 ] && [ "$HAS_F" -eq 1 ]; then
+        echo "Target: 1) vaultpool (HDD)  2) fastpool (NVMe)  3) Both Pools  0) Cancel"
+        printf "Choice: "
+        read P_CHOICE
+        [ "$P_CHOICE" = "0" ] || [ -z "$P_CHOICE" ] && return 0
+        if [ "$P_CHOICE" != "1" ] && [ "$P_CHOICE" != "2" ] && [ "$P_CHOICE" != "3" ]; then
+            echo "❌ Invalid target choice."
+            sleep 1
+            return 1
+        fi
+    elif [ "$HAS_V" -eq 1 ]; then
+        echo "Target: vaultpool/$D_NAME (HDD Archive Only)"
+        P_CHOICE="1"
+    else
+        echo "Target: fastpool/$D_NAME (NVMe Cache Only)"
+        P_CHOICE="2"
+    fi
+
+    echo "Interval: 1) Daily  2) Disable  0) Cancel"
+    printf "Choice: "
+    read INTERVAL
+    [ "$INTERVAL" = "0" ] || [ -z "$INTERVAL" ] && return 0
+
+    if [ "$INTERVAL" != "1" ] && [ "$INTERVAL" != "2" ]; then
+        echo "❌ Invalid interval choice."
+        sleep 1
+        return 1
+    fi
+
+    if [ "$INTERVAL" = "1" ]; then
+        printf "Keep snapshots for how many days? (e.g., 14, 30): "
+        read K_DAYS
+        if ! [ "$K_DAYS" -eq "$K_DAYS" ] 2>/dev/null || [ "$K_DAYS" -le 0 ]; then
+            echo "❌ Error: Retention days must be a positive integer."
+            sleep 2
+            return 1
+        fi
+        if [ "$P_CHOICE" = "1" ] || [ "$P_CHOICE" = "3" ]; then
+            zfs set custom:autosnap=daily "vaultpool/$D_NAME" 2>/dev/null
+            zfs set custom:keep_days="$K_DAYS" "vaultpool/$D_NAME" 2>/dev/null
+        fi
+        if [ "$P_CHOICE" = "2" ] || [ "$P_CHOICE" = "3" ]; then
+            zfs set custom:autosnap=daily "fastpool/$D_NAME" 2>/dev/null
+            zfs set custom:keep_days="$K_DAYS" "fastpool/$D_NAME" 2>/dev/null
+        fi
+        echo "✅ Automated daily snapshot schedule configured (Keep ${K_DAYS}d)."
+        sleep 2
+    elif [ "$INTERVAL" = "2" ]; then
+        if [ "$P_CHOICE" = "1" ] || [ "$P_CHOICE" = "3" ]; then
+            zfs inherit custom:autosnap "vaultpool/$D_NAME" 2>/dev/null
+            zfs inherit custom:keep_days "vaultpool/$D_NAME" 2>/dev/null
+        fi
+        if [ "$P_CHOICE" = "2" ] || [ "$P_CHOICE" = "3" ]; then
+            zfs inherit custom:autosnap "fastpool/$D_NAME" 2>/dev/null
+            zfs inherit custom:keep_days "fastpool/$D_NAME" 2>/dev/null
+        fi
+        echo "✅ Automated snapshot schedule disabled."
+        sleep 2
+    fi
+}
+
+schedule_menu() {
+    while true; do
+        clear
+        echo "=========================================================================="
+        echo "                 ZFS Snapshot Schedule Configuration                      "
+        echo "=========================================================================="
+        echo "   Select a Dataset to Configure Automated Snapshots:"
+        echo ""
+
+        DS_LIST=$(zfs list -H -o name -t filesystem 2>/dev/null | grep '/' | cut -d'/' -f2 | sort | uniq)
+
+        if [ -z "$DS_LIST" ]; then
+            echo "   (No datasets found)"
+            echo "=========================================================================="
+            printf "\nPress Enter to return..."
+            read DUMMY
+            return
+        fi
+
+        set -- $DS_LIST
+        i=1
+        for DIR_NAME in "$@"; do
+            SNAP_V=$(zfs get -H -o value custom:autosnap "vaultpool/$DIR_NAME" 2>/dev/null)
+            SNAP_F=$(zfs get -H -o value custom:autosnap "fastpool/$DIR_NAME" 2>/dev/null)
+            RET_V=$(zfs get -H -o value custom:keep_days "vaultpool/$DIR_NAME" 2>/dev/null)
+            RET_F=$(zfs get -H -o value custom:keep_days "fastpool/$DIR_NAME" 2>/dev/null)
+
+            SNAP_DISP="Disabled"
+            if [ "$SNAP_V" = "daily" ] && [ "$SNAP_F" = "daily" ]; then
+                SNAP_DISP="Both Pools (Daily, Keep ${RET_V}d)"
+            elif [ "$SNAP_V" = "daily" ]; then
+                SNAP_DISP="vaultpool Only (Daily, Keep ${RET_V}d)"
+            elif [ "$SNAP_F" = "daily" ]; then
+                SNAP_DISP="fastpool Only (Daily, Keep ${RET_F}d)"
+            fi
+
+            printf "  %2d) %-20s -> %s\n" "$i" "$DIR_NAME" "$SNAP_DISP"
+            i=$((i + 1))
+        done
+
+        echo "--------------------------------------------------------------------------"
+        echo "   0) Back / Exit"
+        echo "=========================================================================="
+        printf "Select dataset [0-$#]: "
+        read S_OPT
+
+        if [ "$S_OPT" = "0" ] || [ "$S_OPT" = "q" ] || [ "$S_OPT" = "Q" ] || [ "$S_OPT" = "x" ] || [ "$S_OPT" = "X" ]; then
+            return
+        fi
+
+        if [ "$S_OPT" -eq "$S_OPT" ] 2>/dev/null && [ "$S_OPT" -ge 1 ] && [ "$S_OPT" -le "$#" ]; then
+            eval TARGET_DS=\${$S_OPT}
+            configure_dataset_schedule "$TARGET_DS"
+        else
+            echo "❌ Invalid selection."
+            sleep 1
+        fi
+    done
+}
+
 manage_dataset_menu() {
     D_NAME="$1"
 
@@ -397,37 +532,7 @@ manage_dataset_menu() {
                 echo "✅ Created: @$SNAP_NAME"; sleep 2
             
             elif [ "$S_ACT" = "2" ]; then
-                echo ""
-                echo "Target: 1) vaultpool (HDD)  2) fastpool (NVMe)  3) Both Pools  0) Cancel"
-                printf "Choice: "
-                read P_CHOICE
-                [ "$P_CHOICE" = "0" ] && continue
-
-                echo "Interval: 1) Daily  2) Disable"
-                printf "Choice: "
-                read INTERVAL
-
-                if [ "$P_CHOICE" = "1" ] || [ "$P_CHOICE" = "3" ]; then
-                    zfs inherit custom:autosnap vaultpool/$D_NAME 2>/dev/null
-                    zfs inherit custom:keep_days vaultpool/$D_NAME 2>/dev/null
-                fi
-                if [ "$P_CHOICE" = "2" ] || [ "$P_CHOICE" = "3" ]; then
-                    zfs inherit custom:autosnap fastpool/$D_NAME 2>/dev/null
-                    zfs inherit custom:keep_days fastpool/$D_NAME 2>/dev/null
-                fi
-
-                if [ "$INTERVAL" = "1" ]; then
-                    printf "Keep snapshots for how many days? (e.g., 14, 30): "
-                    read K_DAYS
-                    if [ "$P_CHOICE" = "1" ] || [ "$P_CHOICE" = "3" ]; then
-                        zfs set custom:autosnap=daily vaultpool/$D_NAME 2>/dev/null
-                        zfs set custom:keep_days=$K_DAYS vaultpool/$D_NAME 2>/dev/null
-                    fi
-                    if [ "$P_CHOICE" = "2" ] || [ "$P_CHOICE" = "3" ]; then
-                        zfs set custom:autosnap=daily fastpool/$D_NAME 2>/dev/null
-                        zfs set custom:keep_days=$K_DAYS fastpool/$D_NAME 2>/dev/null
-                    fi
-                fi
+                configure_dataset_schedule "$D_NAME"
                 continue
 
             elif [ "$S_ACT" = "3" ]; then
@@ -624,8 +729,17 @@ if [ $# -gt 0 ]; then
             compile_and_reload
             exit 0
             ;;
+        --schedule|schedule)
+            TARGET_DS="$2"
+            if [ -n "$TARGET_DS" ]; then
+                configure_dataset_schedule "$TARGET_DS"
+            else
+                schedule_menu
+            fi
+            exit 0
+            ;;
         *)
-            echo "Usage: manage-shares [--list | --snapshot <dataset> [name] | --delete-dataset <dataset>]"
+            echo "Usage: manage-shares [--list | --snapshot <dataset> [name] | --schedule [dataset] | --delete-dataset <dataset>]"
             exit 1
             ;;
     esac

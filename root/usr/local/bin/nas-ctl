@@ -101,7 +101,7 @@ def menu_zfs():
             run_interactive("/usr/local/bin/cache-mover.sh force -v")
             input("\nPress Enter...")
         elif choice == "5":
-            run_interactive("/usr/local/bin/manage-shares")
+            run_interactive("/usr/local/bin/manage-shares --schedule")
         elif choice == "6":
             break
 

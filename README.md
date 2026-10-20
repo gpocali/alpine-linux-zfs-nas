@@ -26,6 +26,7 @@ Once installed, the updater is also available locally at `/usr/local/bin/nas-upd
 
 * **Safe Update Mode:** Automatically detects existing installations (`/etc/alpine-zfs-nas.installed` or installed scripts) and skips overwriting live configuration files (`/etc/samba/smb.conf`, `/etc/samba/shares.list`, `/etc/lbu/lbu.conf`, etc.).
 * **Multi-Process Config Merging:** Non-destructively merges missing entries into shared system files (`/etc/modules`, `/etc/apk/repositories`, and `/etc/crontabs/root`) without overwriting modules, mirrors, or cron jobs added by other processes.
+* **Automatic Dependency Installation:** Verifies and installs required Alpine APK packages (`python3`, `zfs`, `mergerfs`, `fuse`, `samba`, `samba-common-tools`, `cifs-utils`, `rsync`, `tpm2-tools`, `clevis`, `smartmontools`, `hdparm`, `darkhttpd`) so all CLI and background tools work out of the box.
 * **Automatic LBU Registration:** Registers all managed files outside `/etc` (`/usr/local/bin/*`, `/var/www/dashboard/*`) with `lbu include`.
 
 ---

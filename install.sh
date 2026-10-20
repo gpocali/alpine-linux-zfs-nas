@@ -32,6 +32,18 @@ MERGED_COUNT=0
 SKIPPED_CONFIG_COUNT=0
 UNCHANGED_COUNT=0
 LBU_ADDED_COUNT=0
+PKG_INSTALLED_COUNT=0
+
+# Required Alpine APK packages for all deployed scripts & services:
+# - python3               : Required by nas-ctl, nas-commander, and nas-keytool
+# - zfs                   : Required for ZFS pool and dataset management
+# - mergerfs, fuse        : Required by /etc/init.d/mergerfs-storage
+# - samba, samba-common-tools : Required by manage-shares and manage-share-users
+# - cifs-utils, rsync     : Required by cache-mover.sh, manage-remote-backups, and remote-backup-worker
+# - tpm2-tools, clevis    : Required by zfs-tpm-loader, manage-remote-backups, and remote-backup-worker
+# - smartmontools, hdparm : Required by array-control, generate-telemetry, and spindown.start
+# - darkhttpd             : Required by /etc/init.d/array-dashboard
+REQUIRED_PACKAGES="python3 zfs mergerfs fuse samba samba-common-tools cifs-utils rsync tpm2-tools clevis smartmontools hdparm darkhttpd"
 
 # ==============================================================================
 # Argument Parsing
@@ -644,6 +656,62 @@ if [ -n "$STAGE_DIR" ] && [ -d "$STAGE_DIR" ]; then
 fi
 
 # ==============================================================================
+# Dependency Verification & APK Package Installation
+# ==============================================================================
+ensure_dependencies() {
+    if [ "$TARGET_ROOT" != "/" ]; then
+        log_verbose "Custom TARGET_ROOT ($TARGET_ROOT) active; skipping live APK dependency installation."
+        return 0
+    fi
+
+    if ! command -v apk >/dev/null 2>&1; then
+        log_warn "'apk' package manager not found; skipping dependency installation."
+        return 0
+    fi
+
+    MISSING_PKGS=""
+    MISSING_COUNT=0
+    for pkg in $REQUIRED_PACKAGES; do
+        if ! apk info -e "$pkg" >/dev/null 2>&1; then
+            if [ -z "$MISSING_PKGS" ]; then
+                MISSING_PKGS="$pkg"
+            else
+                MISSING_PKGS="$MISSING_PKGS $pkg"
+            fi
+            MISSING_COUNT=$((MISSING_COUNT + 1))
+        else
+            log_verbose "Dependency already installed: $pkg"
+        fi
+    done
+
+    if [ "$MISSING_COUNT" -eq 0 ]; then
+        log_ok "All required APK package dependencies are already installed."
+        return 0
+    fi
+
+    log_info "Installing $MISSING_COUNT missing APK dependency package(s): $MISSING_PKGS"
+    # shellcheck disable=SC2086
+    if apk update >/dev/null 2>&1 && apk add $MISSING_PKGS; then
+        PKG_INSTALLED_COUNT="$MISSING_COUNT"
+        UPDATES_MADE=1
+        log_ok "Installed missing dependencies: $MISSING_PKGS"
+    else
+        log_warn "Bulk 'apk add' encountered an error; attempting package-by-package installation..."
+        for pkg in $MISSING_PKGS; do
+            if apk add "$pkg"; then
+                PKG_INSTALLED_COUNT=$((PKG_INSTALLED_COUNT + 1))
+                UPDATES_MADE=1
+                log_info "Installed dependency package: $pkg"
+            else
+                log_err "Failed to install dependency package: $pkg"
+            fi
+        done
+    fi
+}
+
+ensure_dependencies
+
+# ==============================================================================
 # Summary Report
 # ==============================================================================
 echo ""
@@ -654,6 +722,7 @@ printf "   Updated Files            : %d\n" "$UPDATED_COUNT"
 printf "   Merged System Configs    : %d\n" "$MERGED_COUNT"
 printf "   Protected Configs Kept   : %d\n" "$SKIPPED_CONFIG_COUNT"
 printf "   New LBU Include Entries  : %d\n" "$LBU_ADDED_COUNT"
+printf "   APK Packages Installed   : %d\n" "$PKG_INSTALLED_COUNT"
 printf "   Unchanged Files          : %d\n" "$UNCHANGED_COUNT"
 printf "\033[1;36m----------------------------------------------------------------------\033[0m\n"
 

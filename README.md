@@ -4,8 +4,8 @@ ZFS Samba NAS Vault with MergerFS Storage Tiers on Alpine Linux with Docker Supp
 ## Architecture Overview
 This repository provides the root filesystem overlay (`root/`) for a diskless Alpine Linux ZFS NAS appliance featuring:
 * **Two-Tier ZFS Storage:** Combines a high-capacity HDD array (`vaultpool`) with a high-speed NVMe cache pool (`fastpool`).
-* **Unified MergerFS Pooling (`/mnt`):** Dynamically merges `/fastpool` and `/vaultpool` under `/mnt` using the `epff` (*Existing Path, First Found*) creation policy (`/etc/init.d/mergerfs-storage`), routing writes based on dataset placement across tiers.
-* **Hardware TPM 2.0 Encryption Unlock:** Automatically unseals ZFS pool encryption keys at boot via `clevis` (`/etc/init.d/zfs-tpm-loader`) and seals remote SMB backup credentials via `tpm2-tools`.
+* **Unified MergerFS Pooling (`/mnt`):** Dynamically merges `/fastpool` and `/vaultpool` under `/mnt` using the `epff` (*Existing Path, First Found*) creation policy (`/etc/init.d/mergerfs-storage`), routing writes based on dataset placement across tiers and waiting for ZFS pools and `/mnt` FUSE mounts to be active before starting dependent services (`samba`, `docker`, `crond`, etc.).
+* **Hardware TPM 2.0 Encryption Unlock & Boot Readiness Gate:** Automatically waits up to `120` seconds at boot for all critical ZFS pools (`vaultpool` and `fastpool`) to initialize and import, unseals ZFS encryption keys via `clevis` (`/etc/init.d/zfs-tpm-loader`), mounts all datasets, and verifies pool readiness before allowing system boot to continue. Also seals remote SMB backup credentials via `tpm2-tools`.
 * **Diskless Alpine Persistence (`lbu`):** Runs from RAM and persists configuration changes back to USB boot media using `lbu commit -d` (`/etc/lbu/lbu.conf`).
 
 ---

@@ -14,4 +14,5 @@ pidfile="/run/${RC_SVCNAME}.pid"
 # Ensure the network is up before trying to bind to port 8080
 depend() {
     need net
+    after zfs-tpm-loader zfs-mount mergerfs-storage
 }

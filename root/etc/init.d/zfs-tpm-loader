@@ -1,29 +1,209 @@
 #!/sbin/openrc-run
 
 name="ZFS TPM Key Loader"
-description="Unseals ZFS master key from TPM and unlocks vaultpool"
+description="Waits for ZFS pools to initialize, unseals TPM master key, and mounts pools"
+
+# Critical ZFS pools that must be imported, unlocked, and mounted before boot continues
+REQUIRED_POOLS="${REQUIRED_POOLS:-vaultpool fastpool}"
+# Maximum time (in seconds) to wait for pools to initialize and mount during boot
+ZFS_BOOT_TIMEOUT="${ZFS_BOOT_TIMEOUT:-120}"
 
 depend() {
     after zfs-import
-    before zfs-mount
+    before zfs-mount mergerfs-storage docker containerd samba smbd nmbd libvirtd postgresql crond array-dashboard local
+}
+
+get_monotonic_seconds() {
+    if [ -r /proc/uptime ]; then
+        awk '{print int($1)}' /proc/uptime
+    else
+        date +%s
+    fi
+}
+
+refresh_block_devices() {
+    modprobe zfs >/dev/null 2>&1 || true
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm trigger --type=devices --action=add >/dev/null 2>&1 || true
+        udevadm settle --timeout=2 >/dev/null 2>&1 || true
+    elif command -v mdev >/dev/null 2>&1; then
+        mdev -s >/dev/null 2>&1 || true
+    fi
+}
+
+pool_is_imported() {
+    zpool list -H -o name "$1" >/dev/null 2>&1
+}
+
+pool_is_healthy() {
+    health=$(zpool list -H -o health "$1" 2>/dev/null || echo "")
+    [ "$health" = "ONLINE" ] || [ "$health" = "DEGRADED" ]
+}
+
+try_import_pool() {
+    pool="$1"
+    pool_is_imported "$pool" && return 0
+
+    # Try standard import first (without mounting yet so TPM keys can be loaded first)
+    zpool import -N "$pool" >/dev/null 2>&1 && return 0
+    [ -d /dev/disk/by-id ] && zpool import -d /dev/disk/by-id -N "$pool" >/dev/null 2>&1 && return 0
+    zpool import -d /dev -N "$pool" >/dev/null 2>&1 && return 0
+
+    # Fallback to forced import (-f) if the pool was not cleanly exported on previous shutdown
+    zpool import -f -N "$pool" >/dev/null 2>&1 && return 0
+    [ -d /dev/disk/by-id ] && zpool import -f -d /dev/disk/by-id -N "$pool" >/dev/null 2>&1 && return 0
+    zpool import -f -d /dev -N "$pool" >/dev/null 2>&1 && return 0
+
+    return 1
+}
+
+unlock_pool_datasets() {
+    pool="$1"
+    key_file="$2"
+    [ -s "$key_file" ] || return 1
+
+    # Load key into the pool root encryption domain
+    kstat=$(zfs get -H -o value keystatus "$pool" 2>/dev/null || echo "")
+    if [ "$kstat" = "unavailable" ]; then
+        zfs load-key "$pool" < "$key_file" >/dev/null 2>&1 || true
+    fi
+
+    # Load key into any encrypted child datasets under the pool
+    for ds in $(zfs list -H -o name -r "$pool" 2>/dev/null); do
+        ds_kstat=$(zfs get -H -o value keystatus "$ds" 2>/dev/null || echo "")
+        if [ "$ds_kstat" = "unavailable" ]; then
+            zfs load-key "$ds" < "$key_file" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+mount_and_verify_pool() {
+    pool="$1"
+    pool_is_imported "$pool" || return 1
+    pool_is_healthy "$pool" || return 1
+
+    kstat=$(zfs get -H -o value keystatus "$pool" 2>/dev/null || echo "")
+    if [ "$kstat" = "unavailable" ] || [ -z "$kstat" ]; then
+        return 1
+    fi
+
+    zfs mount -a >/dev/null 2>&1 || zfs mount -aO >/dev/null 2>&1 || true
+
+    TAB=$(printf '\t')
+    CHECKED_COUNT=0
+    UNMOUNTED_COUNT=0
+
+    while IFS="$TAB" read -r ds_name ds_canmount ds_mp ds_mounted; do
+        [ -z "$ds_name" ] && continue
+        CHECKED_COUNT=$((CHECKED_COUNT + 1))
+
+        ds_kstat=$(zfs get -H -o value keystatus "$ds_name" 2>/dev/null || echo "")
+        if [ "$ds_kstat" = "unavailable" ]; then
+            UNMOUNTED_COUNT=$((UNMOUNTED_COUNT + 1))
+            continue
+        fi
+
+        if [ "$ds_canmount" = "on" ] && [ -n "$ds_mp" ] && [ "$ds_mp" != "none" ] && [ "$ds_mp" != "legacy" ] && [ "$ds_mp" != "-" ]; then
+            if [ "$ds_mounted" != "yes" ]; then
+                mkdir -p "$ds_mp" 2>/dev/null || true
+                zfs mount "$ds_name" >/dev/null 2>&1 || zfs mount -O "$ds_name" >/dev/null 2>&1 || true
+                ds_mounted=$(zfs get -H -o value mounted "$ds_name" 2>/dev/null || echo "no")
+            fi
+
+            if [ "$ds_mounted" != "yes" ] || [ ! -d "$ds_mp" ]; then
+                UNMOUNTED_COUNT=$((UNMOUNTED_COUNT + 1))
+            elif [ -r /proc/mounts ] && ! awk -v mp="$ds_mp" '$2 == mp {found=1} END {exit !found}' /proc/mounts; then
+                UNMOUNTED_COUNT=$((UNMOUNTED_COUNT + 1))
+            fi
+        fi
+    done <<EOF
+$(zfs list -H -o name,canmount,mountpoint,mounted -t filesystem -r "$pool" 2>/dev/null)
+EOF
+
+    [ "$CHECKED_COUNT" -gt 0 ] && [ "$UNMOUNTED_COUNT" -eq 0 ]
 }
 
 start() {
-    ebegin "Unsealing ZFS key from Asus TPM"
-    
+    ebegin "Waiting up to ${ZFS_BOOT_TIMEOUT}s for ZFS pools (${REQUIRED_POOLS}) to initialize, unlock, and mount"
+
     KEY_FILE="/dev/shm/unsealed.key"
+    KEY_READY=0
     umask 077
-    
-    # Decrypt the sealed payload into volatile RAM
-    if clevis decrypt < /etc/zfs/tpm-sealed.jwe > "$KEY_FILE" 2>/dev/null; then
-        # Load the key into vaultpool and fastpool (if present)
-        zfs list -H -o name vaultpool >/dev/null 2>&1 && zfs load-key vaultpool < "$KEY_FILE"
-        zfs list -H -o name fastpool >/dev/null 2>&1 && zfs load-key fastpool < "$KEY_FILE"
-        rm -f "$KEY_FILE"
-        eend 0
-    else
-        rm -f "$KEY_FILE"
-        eend 1 "Failed to unseal key from TPM!"
+    rm -f "$KEY_FILE"
+
+    START_TS=$(get_monotonic_seconds)
+    ATTEMPT=0
+    PENDING_POOLS=""
+
+    while true; do
+        # 1. Import any missing required pools
+        for pool in $REQUIRED_POOLS; do
+            if ! pool_is_imported "$pool"; then
+                refresh_block_devices
+                try_import_pool "$pool" || true
+            fi
+        done
+
+        # 2. Unseal the ZFS master key from the TPM into volatile RAM
+        if [ "$KEY_READY" -eq 0 ]; then
+            if clevis decrypt < /etc/zfs/tpm-sealed.jwe > "$KEY_FILE" 2>/dev/null && [ -s "$KEY_FILE" ]; then
+                KEY_READY=1
+            else
+                rm -f "$KEY_FILE"
+            fi
+        fi
+
+        # 3. Unlock and mount each required pool
+        PENDING_POOLS=""
+        if [ "$KEY_READY" -eq 1 ]; then
+            for pool in $REQUIRED_POOLS; do
+                if pool_is_imported "$pool"; then
+                    unlock_pool_datasets "$pool" "$KEY_FILE"
+                fi
+                if ! mount_and_verify_pool "$pool"; then
+                    if [ -z "$PENDING_POOLS" ]; then
+                        PENDING_POOLS="$pool"
+                    else
+                        PENDING_POOLS="$PENDING_POOLS $pool"
+                    fi
+                fi
+            done
+        else
+            PENDING_POOLS="$REQUIRED_POOLS (awaiting TPM unseal)"
+        fi
+
+        # 4. If all pools are imported, unlocked, and mounted, proceed immediately
+        if [ -z "$PENDING_POOLS" ]; then
+            rm -f "$KEY_FILE"
+            zfs share -a >/dev/null 2>&1 || true
+            eend 0
+            return 0
+        fi
+
+        NOW_TS=$(get_monotonic_seconds)
+        ELAPSED=$((NOW_TS - START_TS))
+        if [ "$ELAPSED" -ge "$ZFS_BOOT_TIMEOUT" ]; then
+            break
+        fi
+
+        if [ $((ATTEMPT % 5)) -eq 0 ]; then
+            einfo "Waiting for ZFS pools [${PENDING_POOLS}] to initialize and mount... (${ELAPSED}s/${ZFS_BOOT_TIMEOUT}s)"
+        fi
+        ATTEMPT=$((ATTEMPT + 1))
+        sleep 1
+    done
+
+    rm -f "$KEY_FILE"
+
+    if [ "$KEY_READY" -eq 0 ]; then
+        eend 1 "Failed to unseal ZFS key from TPM within ${ZFS_BOOT_TIMEOUT}s!"
+        return 1
     fi
+
+    ewarn "Timed out after ${ZFS_BOOT_TIMEOUT}s waiting for ZFS pool(s): ${PENDING_POOLS}. Continuing boot."
+    zfs mount -a >/dev/null 2>&1 || true
+    zfs share -a >/dev/null 2>&1 || true
+    eend 0
 }
+
 

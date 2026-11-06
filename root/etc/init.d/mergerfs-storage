@@ -17,6 +17,94 @@ command_args="-f -o rw,use_ino,allow_other,func.getattr=newest,category.action=a
 command_background="true"
 pidfile="/run/${RC_SVCNAME}.pid"
 
+ZFS_BOOT_TIMEOUT="${ZFS_BOOT_TIMEOUT:-120}"
+
 depend() {
-    after zfs-mount
+    need zfs-tpm-loader zfs-mount
+    after zfs-import zfs-tpm-loader zfs-mount
+    before docker containerd samba smbd nmbd libvirtd postgresql crond array-dashboard local
+}
+
+get_monotonic_seconds() {
+    if [ -r /proc/uptime ]; then
+        awk '{print int($1)}' /proc/uptime
+    else
+        date +%s
+    fi
+}
+
+branch_is_mounted() {
+    branch_dir="$1"
+    pool_name="${branch_dir#/}"
+    pool_name="${pool_name%%/*}"
+
+    if [ -n "$pool_name" ]; then
+        zpool list -H -o name "$pool_name" >/dev/null 2>&1 || return 1
+        mounted_val=$(zfs get -H -o value mounted "$pool_name" 2>/dev/null || echo "no")
+        [ "$mounted_val" = "yes" ] || return 1
+    fi
+
+    [ -d "$branch_dir" ] || return 1
+    if [ -r /proc/mounts ]; then
+        awk -v mp="$branch_dir" '$2 == mp {found=1} END {exit !found}' /proc/mounts || return 1
+    fi
+    return 0
+}
+
+start_pre() {
+    modprobe fuse >/dev/null 2>&1 || true
+    mkdir -p /mnt
+
+    # Extract source branch specification (e.g., /fastpool:/vaultpool) from command_args
+    BRANCH_SPEC=$(printf "%s" "$command_args" | awk '{print $(NF-1)}')
+    BRANCH_DIRS=$(printf "%s" "$BRANCH_SPEC" | tr ':' ' ')
+
+    START_TS=$(get_monotonic_seconds)
+    ATTEMPT=0
+
+    while true; do
+        MISSING_BRANCHES=""
+        for bdir in $BRANCH_DIRS; do
+            [ -z "$bdir" ] && continue
+            if ! branch_is_mounted "$bdir"; then
+                if [ -z "$MISSING_BRANCHES" ]; then
+                    MISSING_BRANCHES="$bdir"
+                else
+                    MISSING_BRANCHES="$MISSING_BRANCHES $bdir"
+                fi
+            fi
+        done
+
+        if [ -z "$MISSING_BRANCHES" ]; then
+            return 0
+        fi
+
+        NOW_TS=$(get_monotonic_seconds)
+        ELAPSED=$((NOW_TS - START_TS))
+        if [ "$ELAPSED" -ge "$ZFS_BOOT_TIMEOUT" ]; then
+            ewarn "Timed out after ${ZFS_BOOT_TIMEOUT}s waiting for MergerFS source mounts (${MISSING_BRANCHES}); starting with available mounts."
+            return 0
+        fi
+
+        if [ $((ATTEMPT % 5)) -eq 0 ]; then
+            einfo "Waiting for ZFS mounts [${MISSING_BRANCHES}] before starting MergerFS... (${ELAPSED}s/${ZFS_BOOT_TIMEOUT}s)"
+        fi
+        zfs mount -a >/dev/null 2>&1 || true
+        ATTEMPT=$((ATTEMPT + 1))
+        sleep 1
+    done
+}
+
+start_post() {
+    # Wait for backgrounded mergerfs daemon to finish mounting /mnt in the VFS
+    WAIT_MNT=0
+    while [ "$WAIT_MNT" -lt 30 ]; do
+        if [ -r /proc/mounts ] && awk '$2 == "/mnt" {found=1} END {exit !found}' /proc/mounts; then
+            return 0
+        fi
+        WAIT_MNT=$((WAIT_MNT + 1))
+        sleep 1
+    done
+    ewarn "MergerFS started, but /mnt was not detected in /proc/mounts within 30s."
+    return 0
 }

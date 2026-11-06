@@ -655,6 +655,12 @@ if [ -n "$STAGE_DIR" ] && [ -d "$STAGE_DIR" ]; then
     STAGE_DIR=""
 fi
 
+# Refresh OpenRC dependency tree cache if init scripts were installed or updated
+if [ "$TARGET_ROOT" = "/" ] && [ "$UPDATES_MADE" -eq 1 ] && command -v rc-update >/dev/null 2>&1; then
+    rc-update -u >/dev/null 2>&1 || true
+    log_verbose "Refreshed OpenRC service dependency tree."
+fi
+
 # ==============================================================================
 # Dependency Verification & APK Package Installation
 # ==============================================================================
